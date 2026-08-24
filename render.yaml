@@ -1,0 +1,49 @@
+services:
+  - type: web
+    name: alvex-backend
+    runtime: go
+    buildCommand: go build -o server ./cmd/server
+    startCommand: ./server
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: ENV
+        value: production
+
+      # --- Supabase PostgreSQL ---
+      # Supabase dashboard → Settings → Database → Connection String (Transaction mode, port 6543)
+      - key: DATABASE_URL
+        value: postgresql://postgres.[YOUR-REF]:[YOUR-PASSWORD]@aws-0-[REGION].pooler.supabase.com:6543/postgres?sslmode=require
+
+      # --- Encryption (MUST be exactly 32 chars — never change after first deploy!) ---
+      # Generate: openssl rand -base64 24
+      - key: ENCRYPTION_KEY
+        value: REPLACE_WITH_YOUR_32_CHAR_KEY_HERE
+
+      # --- Clerk Authentication ---
+      # Get from: https://dashboard.clerk.com → API Keys
+      - key: CLERK_SECRET_KEY
+        value: sk_live_REPLACE_WITH_YOUR_KEY
+      - key: CLERK_WEBHOOK_SECRET
+        value: whsec_REPLACE_WITH_YOUR_WEBHOOK_SECRET
+
+      # --- CORS ---
+      - key: ALLOWED_ORIGINS
+        value: https://lawalvex.netlify.app
+
+      # --- WhatsApp ---
+      - key: WHATSAPP_VERIFY_TOKEN
+        value: alvex-wa-verify-token
+      # - key: WHATSAPP_APP_SECRET
+      #   value: REPLACE_WITH_YOUR_WHATSAPP_SECRET
+
+      # --- AI Providers (platform-level fallback keys) ---
+      # - key: GEMINI_API_KEY
+      #   value: REPLACE_WITH_YOUR_GEMINI_KEY
+      # - key: GROQ_API_KEY
+      #   value: REPLACE_WITH_YOUR_GROQ_KEY
+      # - key: OPENAI_API_KEY
+      #   value: REPLACE_WITH_YOUR_OPENAI_KEY
+
+# NOTE: Supabase manages the PostgreSQL database.
+# No 'databases:' section needed here.

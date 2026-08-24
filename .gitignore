@@ -1,0 +1,35 @@
+# Environment files — NEVER commit these
+.env
+.env.local
+.env.production
+
+# Compiled binaries
+*.exe
+*.exe~
+server
+server_test
+
+# SQLite local database
+*.db
+*.db-shm
+*.db-wal
+
+# Go build cache
+/vendor/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test coverage
+*.out
+coverage.html
+
+# Logs
+*.log
