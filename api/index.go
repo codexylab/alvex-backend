@@ -6,11 +6,11 @@ import (
 	"os"
 	"sync"
 
-	"github.com/codexylab/alvex-backend/internal/config"
-	"github.com/codexylab/alvex-backend/internal/database"
-	"github.com/codexylab/alvex-backend/internal/monitoring"
-	"github.com/codexylab/alvex-backend/internal/queue"
-	"github.com/codexylab/alvex-backend/internal/router"
+	"github.com/codexylab/alvex-backend/pkg/config"
+	"github.com/codexylab/alvex-backend/pkg/database"
+	"github.com/codexylab/alvex-backend/pkg/monitoring"
+	"github.com/codexylab/alvex-backend/pkg/queue"
+	"github.com/codexylab/alvex-backend/pkg/router"
 )
 
 var (
