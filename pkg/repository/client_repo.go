@@ -1,4 +1,4 @@
-﻿package repository
+package repository
 
 import (
 	"context"
@@ -17,14 +17,14 @@ const clientSelectCols = `
 	system_persona, webhook_url, temperature, strict_adherence,
 	billing_plan, custom_rate,
 	COALESCE(gemini_api_key,''), COALESCE(groq_api_key,''),
-	COALESCE(groq_fallback_enabled,0),
+	COALESCE(groq_fallback_enabled,false),
 	scraped_content, scrape_synced_at, scrape_enabled, scrape_interval_hours,
-	COALESCE(widget_chat_enabled,1), COALESCE(widget_ticketing_enabled,1),
-	COALESCE(widget_admin_msg_enabled,1), COALESCE(widget_image_search_enabled,1),
-	COALESCE(widget_ticketing_allowed,1), COALESCE(widget_admin_msg_allowed,1), COALESCE(widget_image_search_allowed,1),
+	COALESCE(widget_chat_enabled,true), COALESCE(widget_ticketing_enabled,true),
+	COALESCE(widget_admin_msg_enabled,true), COALESCE(widget_image_search_enabled,true),
+	COALESCE(widget_ticketing_allowed,true), COALESCE(widget_admin_msg_allowed,true), COALESCE(widget_image_search_allowed,true),
 	COALESCE(widget_brand_name,''), COALESCE(widget_logo_url,''),
 	COALESCE(widget_primary_color,''), COALESCE(widget_secondary_color,''),
-	COALESCE(widget_remove_branding,0), COALESCE(widget_branding_allowed,1)`
+	COALESCE(widget_remove_branding,false), COALESCE(widget_branding_allowed,true)`
 
 // ClientRepository defines the interface for client database operations.
 type ClientRepository interface {
@@ -132,7 +132,7 @@ func (r *SQLClientRepository) List(ctx context.Context, search, status string, p
 func (r *SQLClientRepository) GetByID(ctx context.Context, id string) (*models.Client, error) {
 	row := r.DB.QueryRowContext(ctx, r.DB.Adapt(`SELECT`+clientSelectCols+`,
 		portal_token, owner_id,
-		COALESCE(guardrails_enabled,0), COALESCE(guardrails_reply,''),
+		COALESCE(guardrails_enabled,false), COALESCE(guardrails_reply,''),
 		created_at, updated_at
 	FROM clients WHERE id = $1`), id)
 

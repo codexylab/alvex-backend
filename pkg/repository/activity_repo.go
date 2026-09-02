@@ -1,4 +1,4 @@
-﻿package repository
+package repository
 
 import (
 	"context"
@@ -89,9 +89,9 @@ func (r *SQLActivityRepository) FetchSessionHistory(ctx context.Context, clientI
 // GetWebChatHistory fetches chat history.
 func (r *SQLActivityRepository) GetWebChatHistory(ctx context.Context, clientID, sessionID string) ([]HistoryItem, error) {
 	rows, err := r.DB.QueryContext(ctx, r.DB.Adapt(`
-		SELECT id, message, COALESCE(ai_response,''), status, COALESCE(is_ticket,0), created_at, COALESCE(reaction,''), COALESCE(image_data,'')
+		SELECT id, message, COALESCE(ai_response,''), status, COALESCE(is_ticket,false), created_at, COALESCE(reaction,''), COALESCE(image_data,'')
 		FROM activity_logs
-		WHERE client_id = $1 AND session_id = $2 AND is_ticket = 0
+		WHERE client_id = $1 AND session_id = $2 AND is_ticket = false
 		ORDER BY created_at ASC`), clientID, sessionID,
 	)
 	if err != nil {
@@ -120,9 +120,9 @@ func (r *SQLActivityRepository) GetWebChatHistory(ctx context.Context, clientID,
 // GetWebTicketHistory fetches ticket history.
 func (r *SQLActivityRepository) GetWebTicketHistory(ctx context.Context, clientID, ticketRef string) ([]HistoryItem, error) {
 	rows, err := r.DB.QueryContext(ctx, r.DB.Adapt(`
-		SELECT id, message, COALESCE(ai_response,''), status, COALESCE(is_ticket,0), created_at, COALESCE(reaction,''), COALESCE(image_data,'')
+		SELECT id, message, COALESCE(ai_response,''), status, COALESCE(is_ticket,false), created_at, COALESCE(reaction,''), COALESCE(image_data,'')
 		FROM activity_logs
-		WHERE client_id = $1 AND user_ref = $2 AND is_ticket = 1
+		WHERE client_id = $1 AND user_ref = $2 AND is_ticket = true
 		ORDER BY created_at ASC`), clientID, ticketRef,
 	)
 	if err != nil {

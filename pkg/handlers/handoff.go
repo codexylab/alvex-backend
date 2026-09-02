@@ -1,4 +1,4 @@
-﻿package handlers
+package handlers
 
 import (
 	"encoding/json"
@@ -29,10 +29,10 @@ func NewHandoffHandler(db *database.DB, hub *WSHub) *HandoffHandler {
 func (h *HandoffHandler) ListNeedsAttention(w http.ResponseWriter, r *http.Request) {
 	query := `
 		SELECT id, client_id, client_name, channel, user_ref, session_id, message,
-		       COALESCE(ai_response,''), status, latency_ms, COALESCE(needs_human,0),
+		       COALESCE(ai_response,''), status, latency_ms, COALESCE(needs_human,false),
 		       COALESCE(human_reply,''), replied_at, COALESCE(handoff_reason,''), created_at
 		FROM activity_logs
-		WHERE (needs_human = 1 OR status = 'Needs Human') AND status != 'Resolved'
+		WHERE (needs_human = true OR status = 'Needs Human') AND status != 'Resolved'
 		ORDER BY created_at DESC
 		LIMIT 50
 	`

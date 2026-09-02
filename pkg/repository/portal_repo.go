@@ -1,4 +1,4 @@
-﻿package repository
+package repository
 
 import (
 	"context"
@@ -51,7 +51,7 @@ func NewSQLPortalRepository(db *database.DB) *SQLPortalRepository {
 func (r *SQLPortalRepository) GetClientProfile(ctx context.Context, id string) (*models.Client, error) {
 	row := r.DB.QueryRowContext(ctx, r.DB.Adapt(`SELECT `+clientSelectCols+`,
 		portal_token, owner_id,
-		COALESCE(guardrails_enabled,0), COALESCE(guardrails_reply,''),
+		COALESCE(guardrails_enabled,false), COALESCE(guardrails_reply,''),
 		COALESCE(chat_retention_days,30),
 		created_at, updated_at
 	FROM clients WHERE id = $1`), id)
