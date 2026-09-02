@@ -12,8 +12,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/codexylab/alvex-backend/internal/database"
-	"github.com/codexylab/alvex-backend/internal/handlers"
+	"github.com/codexylab/alvex-backend/pkg/database"
+	"github.com/codexylab/alvex-backend/pkg/handlers"
 	_ "modernc.org/sqlite"
 )
 

@@ -7,12 +7,24 @@
 *.exe
 *.exe~
 server
+server_new
 server_test
+alvex-server-linux
+
+# Deploy and SSH keys
+alvex_deploy_key*
+*.pub
+*.key
+*.pem
+
+# Debug files
+debug_full.txt
 
 # SQLite local database
 *.db
 *.db-shm
 *.db-wal
+
 
 # Go build cache
 /vendor/

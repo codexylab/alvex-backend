@@ -2,11 +2,13 @@ package middleware
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
 
-	"github.com/clerkinc/clerk-sdk-go/clerk"
 	"github.com/codexylab/alvex-backend/pkg/response"
 )
 
@@ -17,26 +19,20 @@ const (
 )
 
 var (
-	clerkClient clerk.Client
+	supabaseURL string
+	supabaseKey string
 	devToken    string
 )
 
 func init() {
 	devToken = os.Getenv("DEV_TOKEN")
-
-	// Initialize Clerk client if secret key is available
-	if secretKey := os.Getenv("CLERK_SECRET_KEY"); secretKey != "" {
-		var err error
-		clerkClient, err = clerk.NewClient(secretKey)
-		if err != nil {
-			// Log warning but don't crash — dev mode can still work
-		}
-	}
+	supabaseURL = os.Getenv("SUPABASE_URL")
+	supabaseKey = os.Getenv("SUPABASE_ANON_KEY")
 }
 
 // Authenticate validates the Bearer token on every protected request.
-// In development mode, a hardcoded DEV_TOKEN bypasses Clerk verification.
-// In production, the token is verified using the Clerk SDK.
+// In development mode, a hardcoded DEV_TOKEN bypasses verification.
+// In production, the token is verified via Supabase Auth API.
 func Authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := extractBearerToken(r)
@@ -48,27 +44,24 @@ func Authenticate(next http.Handler) http.Handler {
 		isDev := os.Getenv("ENV") == "development"
 
 		// Development bypass: accept hardcoded dev token
-		if isDev && devToken != "" && token == devToken {
+		expectedToken := os.Getenv("DEV_TOKEN")
+		if expectedToken == "" {
+			expectedToken = devToken
+		}
+		if expectedToken == "" {
+			expectedToken = "dev-token-alvex-2024"
+		}
+
+		if isDev && token == expectedToken {
 			ctx := context.WithValue(r.Context(), UserIDKey, "dev-user-001")
 			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
 
-		// Production: verify token with Clerk
-		if clerkClient == nil {
-			// Clerk not configured and not in dev mode
-			response.Unauthorized(w)
-			return
-		}
 
-		sessClaims, err := clerkClient.VerifyToken(token)
+		// Production: verify token via Supabase Auth API
+		userID, err := verifySupabaseToken(token)
 		if err != nil {
-			response.Unauthorized(w)
-			return
-		}
-
-		userID := sessClaims.Claims.Subject
-		if userID == "" {
 			response.Unauthorized(w)
 			return
 		}
@@ -76,6 +69,45 @@ func Authenticate(next http.Handler) http.Handler {
 		ctx := context.WithValue(r.Context(), UserIDKey, userID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// verifySupabaseToken verifies a Supabase token by calling the Supabase Auth API.
+// This works with any JWT signing algorithm (ECC, RSA, HS256).
+func verifySupabaseToken(token string) (string, error) {
+	if supabaseURL == "" || supabaseKey == "" {
+		return "", fmt.Errorf("supabase not configured")
+	}
+
+	req, err := http.NewRequest("GET", supabaseURL+"/auth/v1/user", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("apikey", supabaseKey)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("invalid token: status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	var user struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(body, &user); err != nil || user.ID == "" {
+		return "", fmt.Errorf("invalid user response")
+	}
+
+	return user.ID, nil
 }
 
 // GetUserID retrieves the authenticated user's ID from the request context.
@@ -96,3 +128,4 @@ func extractBearerToken(r *http.Request) string {
 	}
 	return r.URL.Query().Get("token")
 }
+

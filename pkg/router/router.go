@@ -1,4 +1,4 @@
-package router
+﻿package router
 
 import (
 	"encoding/json"
@@ -9,14 +9,14 @@ import (
 	chiMiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 
-	"github.com/codexylab/alvex-backend/internal/config"
-	"github.com/codexylab/alvex-backend/internal/database"
-	"github.com/codexylab/alvex-backend/internal/handlers"
-	"github.com/codexylab/alvex-backend/internal/middleware"
-	"github.com/codexylab/alvex-backend/internal/queue"
-	"github.com/codexylab/alvex-backend/internal/ratelimit"
-	"github.com/codexylab/alvex-backend/internal/repository"
-	"github.com/codexylab/alvex-backend/internal/services"
+	"github.com/codexylab/alvex-backend/pkg/config"
+	"github.com/codexylab/alvex-backend/pkg/database"
+	"github.com/codexylab/alvex-backend/pkg/handlers"
+	"github.com/codexylab/alvex-backend/pkg/middleware"
+	"github.com/codexylab/alvex-backend/pkg/queue"
+	"github.com/codexylab/alvex-backend/pkg/ratelimit"
+	"github.com/codexylab/alvex-backend/pkg/repository"
+	"github.com/codexylab/alvex-backend/pkg/services"
 )
 
 // New builds and returns the main chi router with all routes registered.
@@ -32,7 +32,7 @@ func New(cfg *config.Config, db *database.DB, workerPool *queue.WorkerPool) http
 	r.Use(middleware.RequestID) // inject X-Request-Id header + context
 	r.Use(middleware.Logger)
 
-	// CORS — allow configured frontend origins
+	// CORS â€” allow configured frontend origins
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   cfg.AllowedOrigins,
 		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
@@ -109,7 +109,7 @@ func New(cfg *config.Config, db *database.DB, workerPool *queue.WorkerPool) http
 	}
 
 	// -----------------------------------------------------------------------
-	// Health check (public) — includes DB ping, uptime, and WS client count
+	// Health check (public) â€” includes DB ping, uptime, and WS client count
 	// -----------------------------------------------------------------------
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		dbStatus := "ok"
@@ -127,13 +127,13 @@ func New(cfg *config.Config, db *database.DB, workerPool *queue.WorkerPool) http
 	})
 
 	// -----------------------------------------------------------------------
-	// Public Webhooks — Clerk, Stripe, WhatsApp, and Web Chat
+	// Public Webhooks â€” Clerk, Stripe, WhatsApp, and Web Chat
 	// -----------------------------------------------------------------------
 	r.Post("/webhooks/clerk", authH.ClerkWebhook)
 	r.Post("/webhooks/stripe", stripeH.HandleWebhook)
 
 	// -----------------------------------------------------------------------
-	// WebSocket — requires valid session token
+	// WebSocket â€” requires valid session token
 	// -----------------------------------------------------------------------
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.Authenticate)
@@ -141,7 +141,7 @@ func New(cfg *config.Config, db *database.DB, workerPool *queue.WorkerPool) http
 	})
 
 	// -----------------------------------------------------------------------
-	// Public Webhooks — WhatsApp & Web Widget
+	// Public Webhooks â€” WhatsApp & Web Widget
 	// -----------------------------------------------------------------------
 	r.Route("/webhook", func(r chi.Router) {
 		r.Get("/wa/v2/{clientId}", webhookH.VerifyWhatsApp)
@@ -154,7 +154,7 @@ func New(cfg *config.Config, db *database.DB, workerPool *queue.WorkerPool) http
 	})
 
 	// -----------------------------------------------------------------------
-	// Client Portal API — Protected by client portal token
+	// Client Portal API â€” Protected by client portal token
 	// -----------------------------------------------------------------------
 	r.Route("/api/v1/client-portal", func(r chi.Router) {
 		r.Use(middleware.AuthenticateClientPortal(db))
@@ -182,7 +182,7 @@ func New(cfg *config.Config, db *database.DB, workerPool *queue.WorkerPool) http
 	})
 
 	// -----------------------------------------------------------------------
-	// API v1 — All protected by session token
+	// API v1 â€” All protected by session token
 	// -----------------------------------------------------------------------
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Use(middleware.Authenticate)
@@ -225,7 +225,7 @@ func New(cfg *config.Config, db *database.DB, workerPool *queue.WorkerPool) http
 			r.Patch("/invoices/{id}/pay", billingH.MarkPaid)
 		})
 
-		// Analytics — includes Top Questions, Failed Queries, Feedback, CSV export
+		// Analytics â€” includes Top Questions, Failed Queries, Feedback, CSV export
 		r.Route("/analytics", func(r chi.Router) {
 			r.Get("/overview", analyticsH.Overview)
 			r.Get("/trends", analyticsH.Trends)

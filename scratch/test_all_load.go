@@ -7,7 +7,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/codexylab/alvex-backend/internal/database"
+	"github.com/codexylab/alvex-backend/pkg/database"
 	_ "modernc.org/sqlite"
 )
 

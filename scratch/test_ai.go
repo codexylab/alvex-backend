@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/codexylab/alvex-backend/internal/services/ai"
+	"github.com/codexylab/alvex-backend/pkg/services/ai"
 	"github.com/codexylab/alvex-backend/pkg/crypto"
 	_ "modernc.org/sqlite"
 )

@@ -1,4 +1,4 @@
-package services
+﻿package services
 
 import (
 	"context"
@@ -10,9 +10,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/codexylab/alvex-backend/internal/models"
-	"github.com/codexylab/alvex-backend/internal/repository"
-	aiservice "github.com/codexylab/alvex-backend/internal/services/ai"
+	"github.com/codexylab/alvex-backend/pkg/models"
+	"github.com/codexylab/alvex-backend/pkg/repository"
+	aiservice "github.com/codexylab/alvex-backend/pkg/services/ai"
 )
 
 // WSHubInterface defines broadcast capability.
@@ -65,7 +65,7 @@ func detectHandoffTrigger(msg string) (bool, string) {
 		"speak to representative", "connect me to a person", "call me",
 		"live agent", "support agent", "human representative", "human please",
 		"human", "manager", "supervisor", "insan", "banda", "agent",
-		"انسان", "بندہ", "ایجنٹ", "نمائندہ",
+		"Ø§Ù†Ø³Ø§Ù†", "Ø¨Ù†Ø¯Û", "Ø§ÛŒØ¬Ù†Ù¹", "Ù†Ù…Ø§Ø¦Ù†Ø¯Û",
 	}
 
 	for _, t := range triggers {

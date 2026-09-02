@@ -6,8 +6,8 @@ import (
 	"log"
 	"strings"
 
-	"github.com/codexylab/alvex-backend/internal/database"
-	"github.com/codexylab/alvex-backend/internal/services/ai"
+	"github.com/codexylab/alvex-backend/pkg/database"
+	"github.com/codexylab/alvex-backend/pkg/services/ai"
 	"github.com/codexylab/alvex-backend/pkg/crypto"
 	_ "modernc.org/sqlite"
 )
