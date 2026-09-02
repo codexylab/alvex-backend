@@ -18,21 +18,15 @@ const (
 	UserIDKey contextKey = "user_id"
 )
 
-var (
-	supabaseURL string
-	supabaseKey string
-	devToken    string
-)
-
-func init() {
-	devToken = os.Getenv("DEV_TOKEN")
-	supabaseURL = os.Getenv("SUPABASE_URL")
-	supabaseKey = os.Getenv("SUPABASE_ANON_KEY")
-}
-
 // Authenticate validates the Bearer token on every protected request.
-// In development mode, a hardcoded DEV_TOKEN bypasses verification.
-// In production, the token is verified via Supabase Auth API.
+//
+// Priority order:
+//  1. If SUPABASE_URL + SUPABASE_ANON_KEY are set → always verify via Supabase JWT
+//     (works for both local dev and production when Supabase auth is configured)
+//  2. If Supabase is NOT configured → fall back to DEV_TOKEN for local testing only
+//
+// This fixes the init() timing bug where env vars were captured before godotenv loaded.
+// All env vars are now read dynamically per-request via os.Getenv().
 func Authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := extractBearerToken(r)
@@ -41,13 +35,27 @@ func Authenticate(next http.Handler) http.Handler {
 			return
 		}
 
-		isDev := os.Getenv("ENV") == "development"
+		// Read Supabase config dynamically (after godotenv has loaded .env)
+		supabaseURL := os.Getenv("SUPABASE_URL")
+		supabaseKey := os.Getenv("SUPABASE_ANON_KEY")
 
-		// Development bypass: accept hardcoded dev token
-		expectedToken := os.Getenv("DEV_TOKEN")
-		if expectedToken == "" {
-			expectedToken = devToken
+		// --- Priority 1: Supabase JWT verification (local + production) ---
+		// When Supabase is configured, always verify via Supabase regardless of ENV.
+		if supabaseURL != "" && supabaseKey != "" {
+			userID, err := verifySupabaseToken(token, supabaseURL, supabaseKey)
+			if err != nil {
+				response.Unauthorized(w)
+				return
+			}
+			ctx := context.WithValue(r.Context(), UserIDKey, userID)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
 		}
+
+		// --- Priority 2: Dev token fallback (only when Supabase is NOT configured) ---
+		// Useful for pure local testing without any Supabase project.
+		isDev := os.Getenv("ENV") == "development"
+		expectedToken := os.Getenv("DEV_TOKEN")
 		if expectedToken == "" {
 			expectedToken = "dev-token-alvex-2024"
 		}
@@ -58,26 +66,15 @@ func Authenticate(next http.Handler) http.Handler {
 			return
 		}
 
-
-		// Production: verify token via Supabase Auth API
-		userID, err := verifySupabaseToken(token)
-		if err != nil {
-			response.Unauthorized(w)
-			return
-		}
-
-		ctx := context.WithValue(r.Context(), UserIDKey, userID)
-		next.ServeHTTP(w, r.WithContext(ctx))
+		// Neither Supabase nor dev token matched — reject
+		response.Unauthorized(w)
 	})
 }
 
-// verifySupabaseToken verifies a Supabase token by calling the Supabase Auth API.
-// This works with any JWT signing algorithm (ECC, RSA, HS256).
-func verifySupabaseToken(token string) (string, error) {
-	if supabaseURL == "" || supabaseKey == "" {
-		return "", fmt.Errorf("supabase not configured")
-	}
-
+// verifySupabaseToken verifies a Supabase JWT by calling the Supabase Auth REST API.
+// supabaseURL and supabaseKey are passed in (not read from globals) to avoid the
+// init() timing bug where package-level vars captured empty strings before godotenv loaded.
+func verifySupabaseToken(token, supabaseURL, supabaseKey string) (string, error) {
 	req, err := http.NewRequest("GET", supabaseURL+"/auth/v1/user", nil)
 	if err != nil {
 		return "", err
