@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM golang:1.26.6-alpine3.22 AS builder
+FROM golang:1.26.8-alpine3.24 AS builder
 
 WORKDIR /app
 
@@ -21,7 +21,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -o /out/alvex-migrate \
     ./cmd/migrate
 
-FROM alpine:3.22
+FROM alpine:3.24
 
 RUN apk --no-cache add ca-certificates tzdata
 RUN addgroup -S -g 10001 alvex \
