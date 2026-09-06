@@ -1,12 +1,12 @@
-﻿package services
+package services
 
 import (
 	"context"
 	"database/sql"
 	"errors"
 
-	"github.com/codexylab/alvex-backend/pkg/repository"
 	"github.com/codexylab/alvex-backend/pkg/apierr"
+	"github.com/codexylab/alvex-backend/pkg/repository"
 )
 
 // UserService manages the business logic for users.
@@ -31,8 +31,7 @@ func (s *UserService) GetByID(ctx context.Context, id string) (*repository.User,
 	return u, nil
 }
 
-// Upsert inserts or updates a user record from a Clerk webhook event.
-// Called when Clerk fires user.created or user.updated events.
+// Upsert inserts or updates a user record from a verified Supabase identity.
 func (s *UserService) Upsert(ctx context.Context, id, name, email string) error {
 	return s.Repo.Upsert(ctx, id, name, email)
 }

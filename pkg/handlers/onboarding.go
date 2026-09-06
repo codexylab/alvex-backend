@@ -1,4 +1,4 @@
-﻿package handlers
+package handlers
 
 import (
 	"encoding/json"
@@ -7,8 +7,8 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/codexylab/alvex-backend/pkg/middleware"
-	"github.com/codexylab/alvex-backend/pkg/services"
 	"github.com/codexylab/alvex-backend/pkg/response"
+	"github.com/codexylab/alvex-backend/pkg/services"
 )
 
 // OnboardingHandler manages 1-click automated onboarding workflows.

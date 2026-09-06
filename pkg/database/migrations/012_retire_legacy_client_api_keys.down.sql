@@ -1,0 +1,3 @@
+-- Forward-only security migration. Restoring clients.api_key would re-enable
+-- an ambiguous reusable-secret model, so rollback intentionally preserves the
+-- provider-specific columns and leaves the legacy column empty.

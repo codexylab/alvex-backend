@@ -1,3 +1,5 @@
+//go:build ignore
+
 package main
 
 import (
@@ -12,17 +14,17 @@ import (
 )
 
 type Client struct {
-	ID                  string       
-	Name                string       
-	Domain              string       
-	Status              string 
-	Provider            string   
-	Model               string       
-	APIKey              string       
-	GeminiAPIKey        string 
-	GroqAPIKey          string   
-	GroqFallbackEnabled bool         
-	PortalToken         string 
+	ID                  string
+	Name                string
+	Domain              string
+	Status              string
+	Provider            string
+	Model               string
+	APIKey              string
+	GeminiAPIKey        string
+	GroqAPIKey          string
+	GroqFallbackEnabled bool
+	PortalToken         string
 	SystemPersona       string
 	WebhookURL          string
 	Temperature         float64
@@ -49,14 +51,14 @@ func main() {
 
 	id := "law-firm"
 	c := &Client{}
-	var ownerID             sql.NullString
-	var portalToken         sql.NullString
-	var geminiAPIKeyRaw     sql.NullString
-	var groqAPIKeyRaw       sql.NullString
+	var ownerID sql.NullString
+	var portalToken sql.NullString
+	var geminiAPIKeyRaw sql.NullString
+	var groqAPIKeyRaw sql.NullString
 	var groqFallbackEnabled sql.NullBool
-	var scrapedContent      sql.NullString
-	var scrapeSyncedAt      database.NullTime
-	var scrapeEnabled       sql.NullBool
+	var scrapedContent sql.NullString
+	var scrapeSyncedAt database.NullTime
+	var scrapeEnabled sql.NullBool
 	var scrapeIntervalHours sql.NullInt64
 
 	row := db.QueryRowContext(context.Background(), db.Adapt(`
@@ -80,7 +82,7 @@ func main() {
 	if err != nil {
 		log.Fatal("Scan failed: ", err)
 	}
-	
+
 	fmt.Println("🎉 SCAN COMPLETED SUCCESSFULLY!")
 	fmt.Printf("Client ID: %s\n", c.ID)
 	fmt.Printf("Client Name: %s\n", c.Name)

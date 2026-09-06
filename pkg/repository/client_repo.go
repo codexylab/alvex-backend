@@ -4,19 +4,21 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/codexylab/alvex-backend/pkg/database"
 	"github.com/codexylab/alvex-backend/pkg/models"
+	"github.com/codexylab/alvex-backend/pkg/tenant"
 )
 
 // clientSelectCols is the shared SELECT column list common to both List and GetByID queries.
 // Must stay in sync with the scan order in both functions.
-// GetByID extends this with: portal_token, owner_id, guardrails_enabled, guardrails_reply, created_at, updated_at.
+// GetByID extends this with: owner_id, guardrails_enabled, guardrails_reply, created_at, updated_at.
 const clientSelectCols = `
-	id, name, domain, status, provider, model, api_key,
+	id, organization_id, name, domain, COALESCE(allowed_origins, '[]'), COALESCE(whatsapp_phone_number_id, ''), status, provider, model,
 	system_persona, webhook_url, temperature, strict_adherence,
 	billing_plan, custom_rate,
-	COALESCE(gemini_api_key,''), COALESCE(groq_api_key,''),
+	COALESCE(openai_api_key,''), COALESCE(gemini_api_key,''), COALESCE(groq_api_key,''),
 	COALESCE(groq_fallback_enabled,false),
 	scraped_content, scrape_synced_at, scrape_enabled, scrape_interval_hours,
 	COALESCE(widget_chat_enabled,true), COALESCE(widget_ticketing_enabled,true),
@@ -34,17 +36,24 @@ type ClientRepository interface {
 	Create(ctx context.Context, client *models.Client) error
 	Update(ctx context.Context, query string, args ...interface{}) (int64, error)
 	UpdateFields(ctx context.Context, id string, fields map[string]interface{}) (int64, error)
+	UpdateAllStatuses(ctx context.Context, status models.ClientStatus, updatedAt time.Time) (int64, error)
 	Delete(ctx context.Context, id string) (int64, error)
 }
 
 // SQLClientRepository implements ClientRepository for SQL databases.
 type SQLClientRepository struct {
-	DB *database.DB
+	DB                  *database.DB
+	requireOrganization bool
 }
 
 // NewSQLClientRepository creates a new SQLClientRepository instance.
 func NewSQLClientRepository(db *database.DB) *SQLClientRepository {
 	return &SQLClientRepository{DB: db}
+}
+
+// NewTenantSQLClientRepository creates a fail-closed repository for protected APIs.
+func NewTenantSQLClientRepository(db *database.DB) *SQLClientRepository {
+	return &SQLClientRepository{DB: db, requireOrganization: true}
 }
 
 // List retrieves a paginated, searchable, filterable list of clients.
@@ -54,6 +63,19 @@ func (r *SQLClientRepository) List(ctx context.Context, search, status string, p
 	conditions := []string{"1=1"}
 	args := []interface{}{}
 	argIdx := 1
+	if r.requireOrganization {
+		organizationID, err := tenant.RequireOrganizationID(ctx)
+		if err != nil {
+			return nil, 0, err
+		}
+		if r.DB.IsSQLite() {
+			conditions = append(conditions, "organization_id = ?")
+		} else {
+			conditions = append(conditions, fmt.Sprintf("organization_id = $%d", argIdx))
+		}
+		args = append(args, organizationID)
+		argIdx++
+	}
 
 	if search != "" {
 		like := "%" + search + "%"
@@ -118,8 +140,10 @@ func (r *SQLClientRepository) List(ctx context.Context, search, status string, p
 		if err != nil {
 			return nil, 0, err
 		}
-		// Mask API key in list view for security
-		c.APIKey = c.MaskedAPIKey()
+		c.OpenAIAPIKeyConfigured = c.OpenAIAPIKey != ""
+		c.GeminiAPIKeyConfigured = c.GeminiAPIKey != ""
+		c.GroqAPIKeyConfigured = c.GroqAPIKey != ""
+		c.OpenAIAPIKey = ""
 		c.GeminiAPIKey = ""
 		c.GroqAPIKey = ""
 		clients = append(clients, *c)
@@ -130,42 +154,94 @@ func (r *SQLClientRepository) List(ctx context.Context, search, status string, p
 
 // GetByID retrieves a single client by ID.
 func (r *SQLClientRepository) GetByID(ctx context.Context, id string) (*models.Client, error) {
-	row := r.DB.QueryRowContext(ctx, r.DB.Adapt(`SELECT`+clientSelectCols+`,
-		portal_token, owner_id,
+	query := `SELECT` + clientSelectCols + `,
+		owner_id,
 		COALESCE(guardrails_enabled,false), COALESCE(guardrails_reply,''),
 		created_at, updated_at
-	FROM clients WHERE id = $1`), id)
+	FROM clients WHERE id = $1`
+	args := []interface{}{id}
+	if r.requireOrganization {
+		organizationID, err := tenant.RequireOrganizationID(ctx)
+		if err != nil {
+			return nil, err
+		}
+		query += " AND organization_id = $2"
+		args = append(args, organizationID)
+	}
+	row := r.DB.QueryRowContext(ctx, r.DB.Adapt(query), args...)
 
 	return scanClientRow(row, true, false)
 }
 
 // ExistsByID checks if a client exists.
 func (r *SQLClientRepository) ExistsByID(ctx context.Context, id string) (bool, error) {
+	query := `SELECT EXISTS(SELECT 1 FROM clients WHERE id = $1`
+	args := []interface{}{id}
+	if r.requireOrganization {
+		organizationID, err := tenant.RequireOrganizationID(ctx)
+		if err != nil {
+			return false, err
+		}
+		query += " AND organization_id = $2"
+		args = append(args, organizationID)
+	}
+	query += ")"
 	var exists bool
-	err := r.DB.QueryRowContext(ctx, r.DB.Adapt(`SELECT EXISTS(SELECT 1 FROM clients WHERE id = $1)`), id).Scan(&exists)
+	err := r.DB.QueryRowContext(ctx, r.DB.Adapt(query), args...).Scan(&exists)
 	return exists, err
 }
 
 // Create inserts a new client into the database.
 func (r *SQLClientRepository) Create(ctx context.Context, c *models.Client) error {
-	_, err := r.DB.ExecContext(ctx, r.DB.Adapt(`
+	if r.requireOrganization {
+		organizationID, err := tenant.RequireOrganizationID(ctx)
+		if err != nil {
+			return err
+		}
+		c.OrganizationID = organizationID
+	}
+	if c.OrganizationID == "" {
+		return tenant.ErrMissingOrganizationScope
+	}
+	tx, err := r.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.ExecContext(ctx, r.DB.Adapt(`
 		INSERT INTO clients
-		  (id, name, domain, status, provider, model, api_key, system_persona,
-		   webhook_url, temperature, strict_adherence, billing_plan, portal_token, owner_id,
+		  (id, organization_id, name, domain, allowed_origins, status, provider, model, system_persona,
+		   webhook_url, temperature, strict_adherence, billing_plan, owner_id,
 		   widget_chat_enabled, widget_ticketing_enabled, widget_admin_msg_enabled, widget_image_search_enabled,
 		   widget_ticketing_allowed, widget_admin_msg_allowed, widget_image_search_allowed)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`),
-		c.ID, c.Name, c.Domain, c.Status,
-		c.Provider, c.Model, c.APIKey, c.SystemPersona,
-		c.WebhookURL, c.Temperature, c.StrictAdherence, c.BillingPlan, c.PortalToken, c.OwnerID,
+		c.ID, c.OrganizationID, c.Name, c.Domain, MarshalStringSlice(c.AllowedOrigins), c.Status,
+		c.Provider, c.Model, c.SystemPersona,
+		c.WebhookURL, c.Temperature, c.StrictAdherence, c.BillingPlan, c.OwnerID,
 		c.WidgetChatEnabled, c.WidgetTicketingEnabled, c.WidgetAdminMsgEnabled, c.WidgetImageSearchEnabled,
 		c.WidgetTicketingAllowed, c.WidgetAdminMsgAllowed, c.WidgetImageSearchAllowed,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	if c.OwnerID != nil && *c.OwnerID != "" {
+		_, err = tx.ExecContext(ctx, r.DB.Adapt(`
+			INSERT INTO client_memberships (client_id, user_id, role, status)
+			VALUES ($1, $2, 'client_admin', 'active')
+			ON CONFLICT (client_id, user_id) DO NOTHING`), c.ID, *c.OwnerID)
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // Update executes a custom update query on the database.
 func (r *SQLClientRepository) Update(ctx context.Context, query string, args ...interface{}) (int64, error) {
+	if r.requireOrganization {
+		return 0, fmt.Errorf("tenant-scoped repositories cannot execute raw updates")
+	}
 	result, err := r.DB.ExecContext(ctx, r.DB.Adapt(query), args...)
 	if err != nil {
 		return 0, err
@@ -194,11 +270,27 @@ func (r *SQLClientRepository) UpdateFields(ctx context.Context, id string, field
 	}
 
 	args = append(args, id)
+	wherePlaceholder := argIdx
+	var organizationID string
+	if r.requireOrganization {
+		var err error
+		organizationID, err = tenant.RequireOrganizationID(ctx)
+		if err != nil {
+			return 0, err
+		}
+		args = append(args, organizationID)
+	}
 	var query string
 	if r.DB.IsSQLite() {
 		query = fmt.Sprintf("UPDATE clients SET %s WHERE id = ?", strings.Join(sets, ", "))
+		if r.requireOrganization {
+			query += " AND organization_id = ?"
+		}
 	} else {
-		query = fmt.Sprintf("UPDATE clients SET %s WHERE id = $%d", strings.Join(sets, ", "), argIdx)
+		query = fmt.Sprintf("UPDATE clients SET %s WHERE id = $%d", strings.Join(sets, ", "), wherePlaceholder)
+		if r.requireOrganization {
+			query += fmt.Sprintf(" AND organization_id = $%d", wherePlaceholder+1)
+		}
 	}
 
 	result, err := r.DB.ExecContext(ctx, r.DB.Adapt(query), args...)
@@ -208,9 +300,46 @@ func (r *SQLClientRepository) UpdateFields(ctx context.Context, id string, field
 	return result.RowsAffected()
 }
 
+// UpdateAllStatuses updates every client in the active organization. Requiring
+// an organization scope here keeps this bulk operation fail-closed.
+func (r *SQLClientRepository) UpdateAllStatuses(
+	ctx context.Context,
+	status models.ClientStatus,
+	updatedAt time.Time,
+) (int64, error) {
+	organizationID, err := tenant.RequireOrganizationID(ctx)
+	if err != nil {
+		return 0, err
+	}
+	result, err := r.DB.ExecContext(
+		ctx,
+		r.DB.Adapt(`UPDATE clients
+			SET status = ?, updated_at = ?
+			WHERE organization_id = ? AND status <> ?`),
+		status,
+		updatedAt,
+		organizationID,
+		status,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 // Delete deletes a client from the database.
 func (r *SQLClientRepository) Delete(ctx context.Context, id string) (int64, error) {
-	result, err := r.DB.ExecContext(ctx, r.DB.Adapt(`DELETE FROM clients WHERE id = $1`), id)
+	query := `DELETE FROM clients WHERE id = $1`
+	args := []interface{}{id}
+	if r.requireOrganization {
+		organizationID, err := tenant.RequireOrganizationID(ctx)
+		if err != nil {
+			return 0, err
+		}
+		query += " AND organization_id = $2"
+		args = append(args, organizationID)
+	}
+	result, err := r.DB.ExecContext(ctx, r.DB.Adapt(query), args...)
 	if err != nil {
 		return 0, err
 	}

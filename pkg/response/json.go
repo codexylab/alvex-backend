@@ -50,6 +50,12 @@ func Unauthorized(w http.ResponseWriter) {
 	JSON(w, http.StatusUnauthorized, APIResponse{Success: false, Error: "Unauthorized — valid JWT token required"})
 }
 
+// AuthenticationFailed writes a context-specific 401 response without
+// incorrectly implying that every authenticated route uses a JWT.
+func AuthenticationFailed(w http.ResponseWriter, message string) {
+	JSON(w, http.StatusUnauthorized, APIResponse{Success: false, Error: message})
+}
+
 // Forbidden writes a 403 error response.
 func Forbidden(w http.ResponseWriter) {
 	JSON(w, http.StatusForbidden, APIResponse{Success: false, Error: "Forbidden — insufficient permissions"})
@@ -65,7 +71,17 @@ func Conflict(w http.ResponseWriter, err string) {
 	JSON(w, http.StatusConflict, APIResponse{Success: false, Error: err})
 }
 
+// PayloadTooLarge writes a 413 response when a request exceeds its route limit.
+func PayloadTooLarge(w http.ResponseWriter, message string) {
+	JSON(w, http.StatusRequestEntityTooLarge, APIResponse{Success: false, Error: message})
+}
+
 // InternalError writes a 500 error response.
 func InternalError(w http.ResponseWriter) {
 	JSON(w, http.StatusInternalServerError, APIResponse{Success: false, Error: "Internal server error"})
+}
+
+// ServiceUnavailable writes a 503 response for unavailable dependencies or configuration.
+func ServiceUnavailable(w http.ResponseWriter, message string) {
+	JSON(w, http.StatusServiceUnavailable, APIResponse{Success: false, Error: message})
 }

@@ -77,9 +77,17 @@ func (l *Limiter) cleanup() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
+		cutoff := time.Now().Add(-l.window)
 		l.mu.Lock()
 		for id, entry := range l.clients {
 			entry.mu.Lock()
+			valid := entry.requests[:0]
+			for _, requestedAt := range entry.requests {
+				if requestedAt.After(cutoff) {
+					valid = append(valid, requestedAt)
+				}
+			}
+			entry.requests = valid
 			if len(entry.requests) == 0 {
 				delete(l.clients, id)
 			}
@@ -169,4 +177,3 @@ func (d *DailyLimiter) cleanup() {
 		d.mu.Unlock()
 	}
 }
-

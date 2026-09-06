@@ -1,3 +1,5 @@
+//go:build ignore
+
 package main
 
 import (
@@ -6,9 +8,9 @@ import (
 	"log"
 	"strings"
 
+	"github.com/codexylab/alvex-backend/pkg/crypto"
 	"github.com/codexylab/alvex-backend/pkg/database"
 	"github.com/codexylab/alvex-backend/pkg/services/ai"
-	"github.com/codexylab/alvex-backend/pkg/crypto"
 	_ "modernc.org/sqlite"
 )
 
@@ -129,6 +131,6 @@ func main() {
 	if err != nil {
 		fmt.Printf("ERROR: %v\n", err)
 	} else {
-		fmt.Printf("SUCCESS: %q\n", resp)
+		fmt.Printf("SUCCESS: %q\n", resp.Text)
 	}
 }

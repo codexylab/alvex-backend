@@ -1,28 +1,43 @@
-﻿package services
+package services
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/codexylab/alvex-backend/pkg/apierr"
 	"github.com/codexylab/alvex-backend/pkg/models"
 	"github.com/codexylab/alvex-backend/pkg/repository"
 	aiservice "github.com/codexylab/alvex-backend/pkg/services/ai"
-	"github.com/codexylab/alvex-backend/pkg/apierr"
 )
 
 // PortalService coordinates client portal functionalities.
 type PortalService struct {
-	Repo           repository.PortalRepository
-	EncryptionKey  string
-	PlatformGemini string
-	PlatformOpenAI string
-	PlatformGroq   string
-	FallbackGemini string
+	Repo                   repository.PortalRepository
+	AIUsageRepo            repository.AIUsageRepository
+	EncryptionKey          string
+	PreviousEncryptionKeys []string
+	PlatformGemini         string
+	PlatformOpenAI         string
+	PlatformGroq           string
+	FallbackGemini         string
+}
+
+// WithPreviousEncryptionKeys keeps older keys decrypt-only during rotation.
+func (s *PortalService) WithPreviousEncryptionKeys(keys []string) *PortalService {
+	s.PreviousEncryptionKeys = append([]string(nil), keys...)
+	return s
+}
+
+// WithAIUsageRepository enables durable usage metrics for portal AI operations.
+func (s *PortalService) WithAIUsageRepository(repo repository.AIUsageRepository) *PortalService {
+	s.AIUsageRepo = repo
+	return s
 }
 
 // NewPortalService creates a new PortalService instance.
@@ -231,14 +246,18 @@ func (s *PortalService) GenerateFAQsFromText(ctx context.Context, clientID strin
 	}
 
 	apiKey := resolveProviderAPIKey(c, platformKeys{
-		EncryptionKey:  s.EncryptionKey,
-		Gemini:         s.PlatformGemini,
-		OpenAI:         s.PlatformOpenAI,
-		Groq:           s.PlatformGroq,
-		FallbackGemini: s.FallbackGemini,
+		EncryptionKey:          s.EncryptionKey,
+		PreviousEncryptionKeys: s.PreviousEncryptionKeys,
+		Gemini:                 s.PlatformGemini,
+		OpenAI:                 s.PlatformOpenAI,
+		Groq:                   s.PlatformGroq,
+		FallbackGemini:         s.FallbackGemini,
 	})
 
-	aiProvider, err := aiservice.NewProviderWithFallback(string(c.Provider), apiKey, c.Model, s.FallbackGemini)
+	aiProvider, err := aiservice.NewProviderWithFallbackConfig(
+		string(c.Provider), apiKey, c.Model, s.FallbackGemini,
+		aiservice.GenerationConfig{Temperature: c.Temperature},
+	)
 	if err != nil {
 		return fmt.Errorf("failed to build AI provider: %w", err)
 	}
@@ -255,12 +274,27 @@ func (s *PortalService) GenerateFAQsFromText(ctx context.Context, clientID strin
 		contentToAnalyze = contentToAnalyze[:100000]
 	}
 
-	reply, err := aiProvider.Chat(systemPrompt, nil, contentToAnalyze)
+	result, err := aiProvider.Chat(systemPrompt, nil, contentToAnalyze)
 	if err != nil {
 		return fmt.Errorf("AI generation failed: %w", err)
 	}
+	if s.AIUsageRepo != nil && result.Usage.Provider != "" && result.Usage.Model != "" {
+		if usageErr := s.AIUsageRepo.Record(ctx, repository.AIUsageEvent{
+			OrganizationID:   c.OrganizationID,
+			ClientID:         c.ID,
+			Provider:         result.Usage.Provider,
+			Model:            result.Usage.Model,
+			Operation:        "faq_generation",
+			PromptTokens:     result.Usage.PromptTokens,
+			CompletionTokens: result.Usage.CompletionTokens,
+			TotalTokens:      result.Usage.TotalTokens,
+		}); usageErr != nil {
+			// Metrics must never make a successful FAQ generation fail.
+			slog.Warn("failed to persist AI usage", "client_id", c.ID, "operation", "faq_generation", "error", usageErr)
+		}
+	}
 
-	reply = strings.TrimSpace(reply)
+	reply := strings.TrimSpace(result.Text)
 	reply = strings.TrimPrefix(reply, "```json")
 	reply = strings.TrimPrefix(reply, "```")
 	reply = strings.TrimSuffix(reply, "```")

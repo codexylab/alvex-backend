@@ -16,17 +16,17 @@ var (
 // ValidationError wraps a validation message.
 type ValidationError struct{ Message string }
 
-func (e *ValidationError) Error() string       { return e.Message }
+func (e *ValidationError) Error() string        { return e.Message }
 func (e *ValidationError) Is(target error) bool { return target == ErrValidation }
 
 // NotFoundError wraps a not-found message.
 type NotFoundError struct{ Resource string }
 
-func (e *NotFoundError) Error() string       { return e.Resource + " not found" }
+func (e *NotFoundError) Error() string        { return e.Resource + " not found" }
 func (e *NotFoundError) Is(target error) bool { return target == ErrNotFound }
 
 // DuplicateError wraps a duplicate message.
 type DuplicateError struct{ Message string }
 
-func (e *DuplicateError) Error() string       { return e.Message }
+func (e *DuplicateError) Error() string        { return e.Message }
 func (e *DuplicateError) Is(target error) bool { return target == ErrDuplicate }

@@ -1,25 +1,27 @@
+//go:build ignore
+
 package main
 
 import (
 	"database/sql"
 	"fmt"
 	"log"
-	"time"
 	_ "modernc.org/sqlite"
+	"time"
 )
 
 type Client struct {
-	ID                  string       
-	Name                string       
-	Domain              string       
-	Status              string 
-	Provider            string   
-	Model               string       
-	APIKey              string       
-	GeminiAPIKey        string 
-	GroqAPIKey          string   
-	GroqFallbackEnabled bool         
-	PortalToken         string 
+	ID                  string
+	Name                string
+	Domain              string
+	Status              string
+	Provider            string
+	Model               string
+	APIKey              string
+	GeminiAPIKey        string
+	GroqAPIKey          string
+	GroqFallbackEnabled bool
+	PortalToken         string
 	SystemPersona       string
 	WebhookURL          string
 	Temperature         float64
@@ -44,14 +46,14 @@ func main() {
 
 	id := "law-firm"
 	c := &Client{}
-	var ownerID             sql.NullString
-	var portalToken         sql.NullString
-	var geminiAPIKeyRaw     sql.NullString
-	var groqAPIKeyRaw       sql.NullString
+	var ownerID sql.NullString
+	var portalToken sql.NullString
+	var geminiAPIKeyRaw sql.NullString
+	var groqAPIKeyRaw sql.NullString
 	var groqFallbackEnabled sql.NullBool
-	var scrapedContent      sql.NullString
-	var scrapeSyncedAt      sql.NullTime
-	var scrapeEnabled       sql.NullBool
+	var scrapedContent sql.NullString
+	var scrapeSyncedAt sql.NullTime
+	var scrapeEnabled sql.NullBool
 	var scrapeIntervalHours sql.NullInt64
 
 	err = db.QueryRow(`

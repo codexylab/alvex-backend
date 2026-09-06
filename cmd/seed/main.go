@@ -76,7 +76,6 @@ func main() {
 		Status          string
 		Provider        string
 		Model           string
-		APIKey          string
 		SystemPersona   string
 		WebhookURL      string
 		Temperature     float64
@@ -90,7 +89,6 @@ func main() {
 			Status:          "Active",
 			Provider:        "Gemini",
 			Model:           "Gemini Pro",
-			APIKey:          "ALVX-NEXD-8921x42b",
 			SystemPersona:   "You are a senior customer success representative for Nexus Dynamics. Assist clients with platform configuration, deployment logs, and basic API access questions.\n\nTONE: Technical, concise, and helpful.\nRESTRICTIONS: Avoid offering legal advice. ESCALATE custom cluster billing requests to engineering.",
 			WebhookURL:      "http://localhost:8080/webhook/wa/v2/nexus-dynamics",
 			Temperature:     0.7,
@@ -104,7 +102,6 @@ func main() {
 			Status:          "Suspended",
 			Provider:        "Groq",
 			Model:           "Groq Llama-3 70B",
-			APIKey:          "ALVX-STLL-0422x99f",
 			SystemPersona:   "You are an automated logistics support bot for Stellar Logic. Assist users in tracking their orders, verifying shipping dates, and logging support tickets.\n\nTONE: Friendly, structured, and informative.\nRESTRICTIONS: Never issue refunds directly. Refer customers to the human support desk for financial queries.",
 			WebhookURL:      "http://localhost:8080/webhook/wa/v2/stellar-logic",
 			Temperature:     0.5,
@@ -118,7 +115,6 @@ func main() {
 			Status:          "Active",
 			Provider:        "Gemini",
 			Model:           "Gemini Flash",
-			APIKey:          "ALVX-AURA-3310xz11",
 			SystemPersona:   "You are a product specialist for Aura AI Systems. Explain AI capabilities, catalog listings, and starter-pack tiers to site visitors.\n\nTONE: Conversational, upbeat, and persuasive.\nRESTRICTIONS: Stick to standard catalog pricing. Do not negotiate custom discounts.",
 			WebhookURL:      "http://localhost:8080/webhook/wa/v2/aura-ai",
 			Temperature:     0.8,
@@ -132,7 +128,6 @@ func main() {
 			Status:          "Active",
 			Provider:        "OpenAI",
 			Model:           "OpenAI (GPT-4o)",
-			APIKey:          "ALVX-KNTX-5592x7d2",
 			SystemPersona:   "You are a developer relations agent for Kinetix Labs. Answer endpoint schema questions, troubleshoot SDK requests, and help with rate-limit questions.\n\nTONE: Developer-centric, highly analytical, and code-literate.\nRESTRICTIONS: Do not write entire applications. Provide only focused code snippets.",
 			WebhookURL:      "http://localhost:8080/webhook/wa/v2/kinetix-labs",
 			Temperature:     0.4,
@@ -146,7 +141,6 @@ func main() {
 			Status:          "Active",
 			Provider:        "Gemini",
 			Model:           "Gemini Flash",
-			APIKey:          "ALVX-SHOE-7781xz09",
 			SystemPersona:   "You are a customer service assistant for Service Shoes. Help visitors with product sizes, returns, and order queries.\n\nTONE: Friendly, polite, and helpful.\nRESTRICTIONS: Focus strictly on shoe catalogs and order processes.",
 			WebhookURL:      "http://localhost:8080/webhook/wa/v2/service-shoes",
 			Temperature:     0.7,
@@ -171,19 +165,19 @@ func main() {
 				}
 				_, err = db.Exec(`
 					INSERT INTO clients
-					  (id, name, domain, status, provider, model, api_key, system_persona,
+					  (id, name, domain, status, provider, model, system_persona,
 					   webhook_url, temperature, strict_adherence, billing_plan, owner_id, created_at, updated_at)
-					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-					c.ID, c.Name, c.Domain, c.Status, c.Provider, c.Model, c.APIKey, c.SystemPersona,
+					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					c.ID, c.Name, c.Domain, c.Status, c.Provider, c.Model, c.SystemPersona,
 					c.WebhookURL, c.Temperature, strictVal, c.BillingPlan, userID, time.Now(), time.Now(),
 				)
 			} else {
 				_, err = db.Exec(`
 					INSERT INTO clients
-					  (id, name, domain, status, provider, model, api_key, system_persona,
+					  (id, name, domain, status, provider, model, system_persona,
 					   webhook_url, temperature, strict_adherence, billing_plan, owner_id, created_at, updated_at)
-					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
-					c.ID, c.Name, c.Domain, c.Status, c.Provider, c.Model, c.APIKey, c.SystemPersona,
+					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+					c.ID, c.Name, c.Domain, c.Status, c.Provider, c.Model, c.SystemPersona,
 					c.WebhookURL, c.Temperature, c.StrictAdherence, c.BillingPlan, userID, time.Now(), time.Now(),
 				)
 			}

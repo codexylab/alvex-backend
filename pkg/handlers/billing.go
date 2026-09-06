@@ -1,4 +1,4 @@
-﻿package handlers
+package handlers
 
 import (
 	"encoding/json"
@@ -9,10 +9,10 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/codexylab/alvex-backend/pkg/models"
-	"github.com/codexylab/alvex-backend/pkg/services"
 	"github.com/codexylab/alvex-backend/pkg/apierr"
+	"github.com/codexylab/alvex-backend/pkg/models"
 	"github.com/codexylab/alvex-backend/pkg/response"
+	"github.com/codexylab/alvex-backend/pkg/services"
 )
 
 // BillingHandler handles all /api/v1/billing HTTP endpoints.
@@ -31,6 +31,10 @@ func (h *BillingHandler) Stats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response.Success(w, stats)
+}
+
+func (h *BillingHandler) Plans(w http.ResponseWriter, _ *http.Request) {
+	response.Success(w, h.Service.GetPlanCatalog())
 }
 
 // ListInvoices returns all invoices ordered by date descending.

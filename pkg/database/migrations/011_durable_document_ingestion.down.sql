@@ -1,0 +1,2 @@
+-- Production migrations are forward-only. Document source content and chunk
+-- ownership must not be dropped automatically because both contain user data.

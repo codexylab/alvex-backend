@@ -1,17 +1,23 @@
-﻿package services
+package services
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log/slog"
+	"strings"
 	"time"
 
-	"github.com/codexylab/alvex-backend/pkg/models"
+	"github.com/codexylab/alvex-backend/pkg/crypto"
 	"github.com/codexylab/alvex-backend/pkg/repository"
 )
 
-// StripeWebhookEvent represents minimal Stripe event payload structure.
+const StripeWebhookJobType = "stripe.webhook_event"
+
+var ErrInvalidStripeWebhook = errors.New("invalid Stripe webhook")
+
 type StripeWebhookEvent struct {
 	ID   string `json:"id"`
 	Type string `json:"type"`
@@ -20,95 +26,231 @@ type StripeWebhookEvent struct {
 	} `json:"data"`
 }
 
-// StripeInvoiceObject represents the invoice payload from Stripe webhook.
-type StripeInvoiceObject struct {
-	ID             string `json:"id"`
-	Customer       string `json:"customer"`
-	Subscription   string `json:"subscription"`
-	AmountPaid     int64  `json:"amount_paid"`
-	Status         string `json:"status"`
-	CustomerEmail  string `json:"customer_email"`
+type StripeCheckoutCompletedObject struct {
+	ID                string            `json:"id"`
+	Customer          string            `json:"customer"`
+	Subscription      string            `json:"subscription"`
+	ClientReferenceID string            `json:"client_reference_id"`
+	PaymentStatus     string            `json:"payment_status"`
+	Metadata          map[string]string `json:"metadata"`
 }
 
-// StripeSubscriptionObject represents the subscription payload from Stripe webhook.
 type StripeSubscriptionObject struct {
-	ID       string `json:"id"`
-	Customer string `json:"customer"`
-	Status   string `json:"status"`
+	ID                string `json:"id"`
+	Customer          string `json:"customer"`
+	Status            string `json:"status"`
+	CancelAtPeriodEnd bool   `json:"cancel_at_period_end"`
 }
 
-// StripeService handles automated billing, webhooks, and subscription lifecycle events.
+type StripeInvoiceObject struct {
+	ID           string `json:"id"`
+	Customer     string `json:"customer"`
+	Subscription string `json:"subscription"` // Legacy Stripe API versions.
+	Status       string `json:"status"`
+	Currency     string `json:"currency"`
+	Total        int64  `json:"total"`
+	DueDate      int64  `json:"due_date"`
+	Parent       struct {
+		Type                string `json:"type"`
+		SubscriptionDetails struct {
+			Subscription string `json:"subscription"`
+		} `json:"subscription_details"`
+	} `json:"parent"`
+	StatusTransitions struct {
+		PaidAt int64 `json:"paid_at"`
+	} `json:"status_transitions"`
+}
+
+// StripeService owns idempotent webhook dispatch and paid-signup provisioning.
 type StripeService struct {
-	BillingRepo repository.BillingRepository
-	ClientRepo  repository.ClientRepository
+	Events       repository.StripeEventRepository
+	Provisioning repository.StripeProvisioningRepository
+	Checkouts    repository.CheckoutSignupRepository
+	Jobs         repository.BackgroundJobRepository
+	PublicAPIURL string
 }
 
-// NewStripeService creates a new StripeService instance.
-func NewStripeService(billingRepo repository.BillingRepository, clientRepo repository.ClientRepository) *StripeService {
+func NewStripeService(
+	events repository.StripeEventRepository,
+	provisioning repository.StripeProvisioningRepository,
+	checkouts repository.CheckoutSignupRepository,
+	jobs repository.BackgroundJobRepository,
+	publicAPIURL string,
+) *StripeService {
 	return &StripeService{
-		BillingRepo: billingRepo,
-		ClientRepo:  clientRepo,
+		Events:       events,
+		Provisioning: provisioning,
+		Checkouts:    checkouts,
+		Jobs:         jobs,
+		PublicAPIURL: publicAPIURL,
 	}
 }
 
-// HandleWebhook processes inbound Stripe webhook events and updates database state.
-func (s *StripeService) HandleWebhook(ctx context.Context, payload []byte) error {
+// AcceptWebhook validates the minimal event envelope and durably queues the raw
+// JSON before the HTTP handler acknowledges Stripe.
+func (s *StripeService) AcceptWebhook(ctx context.Context, payload []byte) error {
 	var event StripeWebhookEvent
 	if err := json.Unmarshal(payload, &event); err != nil {
-		return fmt.Errorf("invalid stripe webhook event payload: %w", err)
+		return fmt.Errorf("%w: decode event payload: %v", ErrInvalidStripeWebhook, err)
 	}
-
-	slog.Info("processing stripe webhook event", "type", event.Type, "id", event.ID)
-
-	switch event.Type {
-	case "invoice.paid", "invoice.payment_succeeded":
-		var inv StripeInvoiceObject
-		if err := json.Unmarshal(event.Data.Object, &inv); err == nil {
-			slog.Info("stripe invoice paid", "stripe_invoice_id", inv.ID, "customer", inv.Customer)
-			// Mark corresponding invoice paid in database if matching invoice ID or customer
-			if inv.ID != "" {
-				_, _ = s.BillingRepo.MarkPaid(ctx, inv.ID, time.Now())
-			}
-		}
-
-	case "invoice.payment_failed":
-		var inv StripeInvoiceObject
-		if err := json.Unmarshal(event.Data.Object, &inv); err == nil {
-			slog.Warn("stripe payment failed for customer", "customer", inv.Customer)
-		}
-
-	case "customer.subscription.deleted":
-		var sub StripeSubscriptionObject
-		if err := json.Unmarshal(event.Data.Object, &sub); err == nil {
-			slog.Warn("stripe subscription cancelled", "subscription_id", sub.ID, "customer", sub.Customer)
-		}
-
-	default:
-		slog.Debug("unhandled stripe webhook event", "type", event.Type)
+	if event.ID == "" || event.Type == "" {
+		return fmt.Errorf("%w: event ID and type are required", ErrInvalidStripeWebhook)
 	}
-
+	if s.Jobs == nil {
+		return fmt.Errorf("Stripe webhook queue is not configured")
+	}
+	_, err := s.Jobs.Enqueue(ctx, StripeWebhookJobType, event.ID, payload, 6)
+	if err != nil {
+		if errors.Is(err, repository.ErrBackgroundJobPayloadMismatch) {
+			return fmt.Errorf("%w: duplicate event payload mismatch", ErrInvalidStripeWebhook)
+		}
+		return fmt.Errorf("enqueue Stripe webhook event: %w", err)
+	}
 	return nil
 }
 
-// UpdateClientStripeInfo associates a client with their Stripe Customer and Subscription IDs.
-func (s *StripeService) UpdateClientStripeInfo(ctx context.Context, clientID, stripeCustID, stripeSubID string) error {
-	fields := map[string]interface{}{
-		"stripe_customer_id":     stripeCustID,
-		"stripe_subscription_id": stripeSubID,
-		"updated_at":             time.Now(),
+func (s *StripeService) HandleWebhook(ctx context.Context, payload []byte) error {
+	var event StripeWebhookEvent
+	if err := json.Unmarshal(payload, &event); err != nil {
+		return fmt.Errorf("invalid Stripe webhook event payload: %w", err)
 	}
-	_, err := s.ClientRepo.UpdateFields(ctx, clientID, fields)
-	return err
+	if event.ID == "" || event.Type == "" {
+		return fmt.Errorf("Stripe webhook event ID and type are required")
+	}
+	digest := sha256.Sum256(payload)
+	claimed, err := s.Events.ClaimEvent(ctx, event.ID, event.Type, hex.EncodeToString(digest[:]))
+	if err != nil {
+		return fmt.Errorf("claim Stripe webhook event: %w", err)
+	}
+	if !claimed {
+		return nil
+	}
+
+	if err := s.processEvent(ctx, event); err != nil {
+		_ = s.Events.FailEvent(ctx, event.ID, err.Error())
+		return err
+	}
+	if err := s.Events.CompleteEvent(ctx, event.ID); err != nil {
+		return fmt.Errorf("complete Stripe webhook event: %w", err)
+	}
+	return nil
 }
 
-// GetPlanPricing returns standard pricing details for subscription plans.
-func (s *StripeService) GetPlanPricing(plan models.BillingPlan) float64 {
-	switch plan {
-	case models.BillingEnterprise:
-		return 499.00
-	case models.BillingPro:
-		return 99.00
+func (s *StripeService) processEvent(ctx context.Context, event StripeWebhookEvent) error {
+	switch event.Type {
+	case "checkout.session.completed":
+		var checkout StripeCheckoutCompletedObject
+		if err := json.Unmarshal(event.Data.Object, &checkout); err != nil {
+			return fmt.Errorf("decode completed Checkout session: %w", err)
+		}
+		return s.provisionCheckout(ctx, checkout)
+	case "customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted":
+		var subscription StripeSubscriptionObject
+		if err := json.Unmarshal(event.Data.Object, &subscription); err != nil {
+			return fmt.Errorf("decode Stripe subscription: %w", err)
+		}
+		if subscription.ID == "" || subscription.Customer == "" || subscription.Status == "" {
+			return fmt.Errorf("Stripe subscription event is missing required fields")
+		}
+		return s.Provisioning.UpdateSubscription(
+			ctx,
+			subscription.ID,
+			subscription.Customer,
+			subscription.Status,
+			subscription.CancelAtPeriodEnd,
+		)
+	case "invoice.paid", "invoice.payment_failed":
+		var invoice StripeInvoiceObject
+		if err := json.Unmarshal(event.Data.Object, &invoice); err != nil {
+			return fmt.Errorf("decode Stripe invoice: %w", err)
+		}
+		return s.applyInvoice(ctx, event.Type, invoice)
 	default:
-		return 29.00
+		return nil
 	}
+}
+
+func (s *StripeService) applyInvoice(ctx context.Context, eventType string, invoice StripeInvoiceObject) error {
+	subscriptionID := invoice.Subscription
+	if invoice.Parent.Type == "subscription_details" && invoice.Parent.SubscriptionDetails.Subscription != "" {
+		subscriptionID = invoice.Parent.SubscriptionDetails.Subscription
+	}
+	if !strings.HasPrefix(invoice.ID, "in_") ||
+		!strings.HasPrefix(invoice.Customer, "cus_") ||
+		!strings.HasPrefix(subscriptionID, "sub_") ||
+		len(invoice.Currency) != 3 || invoice.Total < 0 {
+		return fmt.Errorf("Stripe invoice event is missing required fields")
+	}
+
+	internalStatus := "Pending"
+	providerStatus := invoice.Status
+	var paidAt *time.Time
+	if eventType == "invoice.paid" {
+		internalStatus = "Paid"
+		providerStatus = "paid"
+		if invoice.StatusTransitions.PaidAt > 0 {
+			value := time.Unix(invoice.StatusTransitions.PaidAt, 0).UTC()
+			paidAt = &value
+		}
+	} else {
+		providerStatus = "payment_failed"
+	}
+	var dueAt *time.Time
+	if invoice.DueDate > 0 {
+		value := time.Unix(invoice.DueDate, 0).UTC()
+		dueAt = &value
+	}
+
+	return s.Provisioning.UpsertInvoice(ctx, repository.StripeInvoiceInput{
+		ProviderInvoiceID:    invoice.ID,
+		ProviderSubscription: subscriptionID,
+		ProviderCustomer:     invoice.Customer,
+		ProviderStatus:       providerStatus,
+		InternalStatus:       internalStatus,
+		Currency:             strings.ToUpper(invoice.Currency),
+		Amount:               float64(invoice.Total) / 100,
+		DueAt:                dueAt,
+		PaidAt:               paidAt,
+	})
+}
+
+func (s *StripeService) provisionCheckout(ctx context.Context, checkout StripeCheckoutCompletedObject) error {
+	signupID := checkout.Metadata["signup_id"]
+	if checkout.ID == "" || signupID == "" || checkout.Customer == "" || checkout.Subscription == "" {
+		return fmt.Errorf("completed Checkout session is missing required fields")
+	}
+	if checkout.PaymentStatus != "paid" && checkout.PaymentStatus != "no_payment_required" {
+		return fmt.Errorf("Checkout session payment is not complete")
+	}
+
+	signup, err := s.Checkouts.GetByID(ctx, signupID)
+	if err != nil {
+		return fmt.Errorf("load checkout signup: %w", err)
+	}
+	if checkout.ClientReferenceID != signup.AppUserID {
+		return fmt.Errorf("Checkout session owner does not match signup")
+	}
+
+	suffix := strings.ReplaceAll(signup.ID, "-", "")
+	if len(suffix) > 8 {
+		suffix = suffix[:8]
+	}
+	clientID := crypto.SlugifyClientName(signup.ClientName) + "-" + suffix
+	organizationSlug := crypto.SlugifyClientName(signup.OrganizationName) + "-" + suffix
+	return s.Provisioning.ProvisionPaidSignup(ctx, repository.CheckoutProvisioningInput{
+		SignupID:         signup.ID,
+		SessionID:        checkout.ID,
+		AppUserID:        signup.AppUserID,
+		CustomerID:       checkout.Customer,
+		SubscriptionID:   checkout.Subscription,
+		OrganizationID:   "org_" + signup.ID,
+		OrganizationSlug: organizationSlug,
+		ClientID:         clientID,
+		SystemPersona: fmt.Sprintf(
+			"You are an AI representative for %s. Help visitors with inquiries on %s.",
+			signup.ClientName,
+			signup.Domain,
+		),
+		WebhookURL: crypto.GenerateWebhookURL(s.PublicAPIURL, clientID),
+	})
 }

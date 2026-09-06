@@ -1,3 +1,5 @@
+//go:build ignore
+
 package main
 
 import (
@@ -123,7 +125,7 @@ func testQuery(router *chi.Mux, query string, expected string) {
 	}
 
 	fmt.Printf("[RESPONSE (took %v)]: %s\n", elapsed.Round(time.Millisecond), res.Data["reply"])
-	
+
 	// Add delay to avoid hitting LLM API rate limits in automated tests
 	time.Sleep(3 * time.Second)
 }

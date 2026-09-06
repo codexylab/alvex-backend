@@ -1,4 +1,4 @@
-﻿package handlers
+package handlers
 
 import (
 	"encoding/csv"
@@ -13,11 +13,12 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/codexylab/alvex-backend/pkg/apierr"
+	"github.com/codexylab/alvex-backend/pkg/csvsafe"
 	"github.com/codexylab/alvex-backend/pkg/middleware"
 	"github.com/codexylab/alvex-backend/pkg/models"
-	"github.com/codexylab/alvex-backend/pkg/services"
-	"github.com/codexylab/alvex-backend/pkg/apierr"
 	"github.com/codexylab/alvex-backend/pkg/response"
+	"github.com/codexylab/alvex-backend/pkg/services"
 )
 
 // ClientPortalHandler serves the client-facing portal API.
@@ -240,11 +241,11 @@ func (h *ClientPortalHandler) ExportConversations(w http.ResponseWriter, r *http
 		slog.Warn("failed to fetch activity logs for export", "client_id", clientID, "error", err)
 	}
 	for _, log := range logs {
-		cw.Write([]string{
+		cw.Write(csvsafe.Row(
 			log.ID, log.UserRef, string(log.Channel), log.Message, log.AIResponse, string(log.Status),
 			fmt.Sprintf("%d", log.LatencyMs),
 			log.CreatedAt.Format(time.RFC3339),
-		})
+		))
 	}
 }
 

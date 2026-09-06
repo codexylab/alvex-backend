@@ -68,7 +68,7 @@ func (e *EmbeddingService) GenerateEmbedding(ctx context.Context, text string) (
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("embedding API error (status %d): %s", resp.StatusCode, string(raw))
+		return nil, fmt.Errorf("embedding API returned HTTP %d", resp.StatusCode)
 	}
 
 	var result struct {

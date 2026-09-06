@@ -1,29 +1,28 @@
-﻿package handlers
+package handlers
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/codexylab/alvex-backend/pkg/apierr"
 	"github.com/codexylab/alvex-backend/pkg/middleware"
 	"github.com/codexylab/alvex-backend/pkg/models"
-	"github.com/codexylab/alvex-backend/pkg/services"
-	"github.com/codexylab/alvex-backend/pkg/apierr"
 	"github.com/codexylab/alvex-backend/pkg/response"
+	"github.com/codexylab/alvex-backend/pkg/services"
 )
 
 // ClientHandler handles all /api/v1/clients HTTP transport routing.
 type ClientHandler struct {
-	Service   *services.ClientService
-	PortalSvc *services.PortalService
+	Service     *services.ClientService
+	WebsiteSync *services.WebsiteIndexScheduler
 }
 
 // List returns a paginated, searchable, filterable list of clients.
@@ -49,6 +48,9 @@ func (h *ClientHandler) List(w http.ResponseWriter, r *http.Request) {
 		response.InternalError(w)
 		return
 	}
+	for i := range clients {
+		redactClientSecrets(&clients[i])
+	}
 
 	totalPages := (total + limit - 1) / limit
 	if totalPages == 0 {
@@ -69,14 +71,24 @@ func (h *ClientHandler) List(w http.ResponseWriter, r *http.Request) {
 // POST /api/v1/clients
 func (h *ClientHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var req models.CreateClientRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
 		response.BadRequest(w, "Invalid JSON body")
+		return
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		response.BadRequest(w, "Request body must contain one JSON object")
 		return
 	}
 
 	ownerID := middleware.GetUserID(r)
 	client, err := h.Service.Create(r.Context(), req, ownerID)
 	if err != nil {
+		if errors.Is(err, apierr.ErrValidation) {
+			response.BadRequest(w, err.Error())
+			return
+		}
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "duplicate") {
 			response.Conflict(w, errMsg)
@@ -91,28 +103,35 @@ func (h *ClientHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Trigger background website scrape if domain is provided
-	if req.Domain != "" && h.PortalSvc != nil {
-		go func(cid, dom string) {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			defer cancel()
-			_, _, _ = h.Service.ScrapeAndSave(ctx, cid, dom, h.PortalSvc)
-		}(client.ID, req.Domain)
+	if req.Domain != "" && h.WebsiteSync != nil {
+		key := services.WebsiteSyncClientCreate + ":" + client.ID
+		if _, queueErr := h.WebsiteSync.Enqueue(
+			r.Context(), client.ID, req.Domain, services.WebsiteSyncClientCreate, key,
+		); queueErr != nil {
+			log.Printf("[ERROR] queue initial website sync for %s: %v", client.ID, queueErr)
+		}
 	}
 
+	redactClientSecrets(client)
 	response.Created(w, client)
 }
 
-// GetOne returns a single client by ID with full (unmasked) API key.
+// GetOne returns configuration without exposing write-only provider credentials.
 //
 // GET /api/v1/clients/:id
 func (h *ClientHandler) GetOne(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	client, err := h.Service.GetByID(r.Context(), id)
 	if err != nil {
-		response.NotFound(w, "Client")
+		if errors.Is(err, apierr.ErrNotFound) {
+			response.NotFound(w, "Client")
+			return
+		}
+		log.Printf("[ERROR] clients GetOne failed: %v", err)
+		response.InternalError(w)
 		return
 	}
+	redactClientSecrets(client)
 	response.Success(w, client)
 }
 
@@ -123,13 +142,23 @@ func (h *ClientHandler) Update(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
 	var req models.UpdateClientRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
 		response.BadRequest(w, "Invalid JSON body")
+		return
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		response.BadRequest(w, "Request body must contain one JSON object")
 		return
 	}
 
 	client, domainToSync, err := h.Service.Update(r.Context(), id, req)
 	if err != nil {
+		if errors.Is(err, apierr.ErrValidation) {
+			response.BadRequest(w, err.Error())
+			return
+		}
 		if errors.Is(err, apierr.ErrNotFound) {
 			response.NotFound(w, "Client")
 			return
@@ -139,25 +168,46 @@ func (h *ClientHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if domainToSync != "" && h.PortalSvc != nil {
-		go func(cid, dom string) {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			defer cancel()
-			_, _, _ = h.Service.ScrapeAndSave(ctx, cid, dom, h.PortalSvc)
-		}(id, domainToSync)
+	if domainToSync != "" && h.WebsiteSync != nil {
+		key := services.WebsiteSyncDomainChange + ":" + id + ":" + domainToSync
+		if _, queueErr := h.WebsiteSync.Enqueue(
+			r.Context(), id, domainToSync, services.WebsiteSyncDomainChange, key,
+		); queueErr != nil {
+			log.Printf("[ERROR] queue changed-domain website sync for %s: %v", id, queueErr)
+		}
 	}
 
+	redactClientSecrets(client)
 	response.Success(w, client)
 }
 
-// ToggleStatus switches a client between Active and Suspended states.
+// ToggleStatus sets the requested state, or supports the legacy empty-body
+// toggle behavior for older clients.
 //
 // PATCH /api/v1/clients/:id/status
 func (h *ClientHandler) ToggleStatus(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
-	newStatus, err := h.Service.ToggleStatus(r.Context(), id)
+	var req models.UpdateClientStatusRequest
+	decodeErr := json.NewDecoder(r.Body).Decode(&req)
+	var (
+		newStatus string
+		err       error
+	)
+	switch {
+	case errors.Is(decodeErr, io.EOF):
+		newStatus, err = h.Service.ToggleStatus(r.Context(), id)
+	case decodeErr != nil:
+		response.BadRequest(w, "Invalid JSON body")
+		return
+	default:
+		newStatus, err = h.Service.SetStatus(r.Context(), id, req.Status)
+	}
 	if err != nil {
+		if errors.Is(err, apierr.ErrValidation) {
+			response.BadRequest(w, err.Error())
+			return
+		}
 		if errors.Is(err, apierr.ErrNotFound) {
 			response.NotFound(w, "Client")
 			return
@@ -168,6 +218,34 @@ func (h *ClientHandler) ToggleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response.Message(w, fmt.Sprintf("Client status updated to %s", newStatus))
+}
+
+// SetAllStatuses applies an explicit state to every client in the active
+// organization.
+//
+// PATCH /api/v1/clients/status
+func (h *ClientHandler) SetAllStatuses(w http.ResponseWriter, r *http.Request) {
+	var req models.UpdateClientStatusRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.BadRequest(w, "Invalid JSON body")
+		return
+	}
+
+	updatedCount, err := h.Service.SetAllStatuses(r.Context(), req.Status)
+	if err != nil {
+		if errors.Is(err, apierr.ErrValidation) {
+			response.BadRequest(w, err.Error())
+			return
+		}
+		log.Printf("[ERROR] clients SetAllStatuses failed: %v", err)
+		response.InternalError(w)
+		return
+	}
+
+	response.Success(w, map[string]interface{}{
+		"status":        req.Status,
+		"updated_count": updatedCount,
+	})
 }
 
 // Delete permanently removes a client profile.
@@ -194,43 +272,16 @@ func (h *ClientHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	response.NoContent(w)
 }
 
-// RotateToken generates a new portal token for a client, invalidating the old one.
-//
-// POST /api/v1/clients/:id/rotate-token
-func (h *ClientHandler) RotateToken(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-
-	client, err := h.Service.RotateToken(r.Context(), id)
-	if err != nil {
-		if errors.Is(err, apierr.ErrNotFound) {
-			response.NotFound(w, "Client")
-			return
-		}
-		log.Printf("[ERROR] clients RotateToken failed: %v", err)
-		response.InternalError(w)
+// redactClientSecrets keeps provider credentials write-only. Machine keys use
+// the separate /api-keys lifecycle and are never part of a client response.
+func redactClientSecrets(client *models.Client) {
+	if client == nil {
 		return
 	}
-
-	response.Success(w, client)
-}
-
-// RotateKey generates a new platform API key for a client, invalidating the previous key.
-//
-// POST /api/v1/clients/:id/rotate-key
-func (h *ClientHandler) RotateKey(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	userID := middleware.GetUserID(r)
-
-	client, err := h.Service.RotateAPIKey(r.Context(), id, userID)
-	if err != nil {
-		if errors.Is(err, apierr.ErrNotFound) {
-			response.NotFound(w, "Client")
-			return
-		}
-		log.Printf("[ERROR] clients RotateKey failed: %v", err)
-		response.InternalError(w)
-		return
-	}
-
-	response.Success(w, client)
+	client.OpenAIAPIKeyConfigured = client.OpenAIAPIKeyConfigured || client.OpenAIAPIKey != ""
+	client.GeminiAPIKeyConfigured = client.GeminiAPIKeyConfigured || client.GeminiAPIKey != ""
+	client.GroqAPIKeyConfigured = client.GroqAPIKeyConfigured || client.GroqAPIKey != ""
+	client.OpenAIAPIKey = ""
+	client.GeminiAPIKey = ""
+	client.GroqAPIKey = ""
 }

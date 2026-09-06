@@ -1,4 +1,4 @@
-﻿package handlers
+package handlers
 
 import (
 	"encoding/csv"
@@ -7,8 +7,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/codexylab/alvex-backend/pkg/services"
+	"github.com/codexylab/alvex-backend/pkg/csvsafe"
 	"github.com/codexylab/alvex-backend/pkg/response"
+	"github.com/codexylab/alvex-backend/pkg/services"
 )
 
 // AnalyticsHandler handles all /api/v1/analytics HTTP endpoints.
@@ -127,7 +128,7 @@ func (h *AnalyticsHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 			var id, name, domain, status, provider, model, plan string
 			var createdAt time.Time
 			if err := rows.Scan(&id, &name, &domain, &status, &provider, &model, &plan, &createdAt); err == nil {
-				cw.Write([]string{id, name, domain, status, provider, model, plan, createdAt.Format("2006-01-02")})
+				cw.Write(csvsafe.Row(id, name, domain, status, provider, model, plan, createdAt.Format("2006-01-02")))
 			}
 		}
 
@@ -138,7 +139,7 @@ func (h *AnalyticsHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 			var amount float64
 			var createdAt time.Time
 			if err := rows.Scan(&id, &client, &amount, &status, &dueDate, &createdAt); err == nil {
-				cw.Write([]string{id, client, fmt.Sprintf("%.2f", amount), status, dueDate, createdAt.Format("2006-01-02")})
+				cw.Write(csvsafe.Row(id, client, fmt.Sprintf("%.2f", amount), status, dueDate, createdAt.Format("2006-01-02")))
 			}
 		}
 
@@ -149,8 +150,8 @@ func (h *AnalyticsHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 			var latency int64
 			var createdAt time.Time
 			if err := rows.Scan(&id, &client, &channel, &user, &message, &status, &latency, &createdAt); err == nil {
-				cw.Write([]string{id, client, channel, user, message, status,
-					fmt.Sprintf("%d", latency), createdAt.Format(time.RFC3339)})
+				cw.Write(csvsafe.Row(id, client, channel, user, message, status,
+					fmt.Sprintf("%d", latency), createdAt.Format(time.RFC3339)))
 			}
 		}
 	}

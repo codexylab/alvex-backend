@@ -1,13 +1,13 @@
-﻿package repository
+package repository
 
 import (
 	"context"
 	"database/sql"
-	"strings"
 	"time"
 
 	"github.com/codexylab/alvex-backend/pkg/database"
 	"github.com/codexylab/alvex-backend/pkg/models"
+	"github.com/codexylab/alvex-backend/pkg/tenant"
 )
 
 // TrendDataPoint represents a single data point in the trends chart.
@@ -25,9 +25,9 @@ type TopQuestion struct {
 
 // SatisfactionStats represents positive vs negative customer feedback.
 type SatisfactionStats struct {
-	TotalFeedback int     `json:"total_feedback"`
-	PositiveCount int     `json:"positive_count"`
-	NegativeCount int     `json:"negative_count"`
+	TotalFeedback   int     `json:"total_feedback"`
+	PositiveCount   int     `json:"positive_count"`
+	NegativeCount   int     `json:"negative_count"`
 	SatisfactionPct float64 `json:"satisfaction_pct"`
 }
 
@@ -58,16 +58,24 @@ func NewSQLAnalyticsRepository(db *database.DB) *SQLAnalyticsRepository {
 }
 
 func (r *SQLAnalyticsRepository) GetOverviewCounts(ctx context.Context) (total, active int, err error) {
-	err = r.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM clients`).Scan(&total)
+	organizationID, err := tenant.RequireOrganizationID(ctx)
 	if err != nil {
 		return 0, 0, err
 	}
-	err = r.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM clients WHERE status = 'Active'`).Scan(&active)
+	err = r.DB.QueryRowContext(ctx, r.DB.Adapt(`SELECT COUNT(*) FROM clients WHERE organization_id = $1`), organizationID).Scan(&total)
+	if err != nil {
+		return 0, 0, err
+	}
+	err = r.DB.QueryRowContext(ctx, r.DB.Adapt(`SELECT COUNT(*) FROM clients WHERE organization_id = $1 AND status = 'Active'`), organizationID).Scan(&active)
 	return total, active, err
 }
 
 func (r *SQLAnalyticsRepository) GetBillingPlans(ctx context.Context) ([]string, error) {
-	rows, err := r.DB.QueryContext(ctx, `SELECT billing_plan FROM clients WHERE status = 'Active'`)
+	organizationID, err := tenant.RequireOrganizationID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := r.DB.QueryContext(ctx, r.DB.Adapt(`SELECT billing_plan FROM clients WHERE organization_id = $1 AND status = 'Active'`), organizationID)
 	if err != nil {
 		return nil, err
 	}
@@ -85,88 +93,88 @@ func (r *SQLAnalyticsRepository) GetBillingPlans(ctx context.Context) ([]string,
 }
 
 func (r *SQLAnalyticsRepository) GetActivityLogsSummary(ctx context.Context) (totalLogs, failedLogs int, err error) {
-	err = r.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM activity_logs`).Scan(&totalLogs)
+	organizationID, err := tenant.RequireOrganizationID(ctx)
 	if err != nil {
 		return 0, 0, err
 	}
-	err = r.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM activity_logs WHERE status = 'Failed'`).Scan(&failedLogs)
+	scopeFilter := `EXISTS (SELECT 1 FROM clients c WHERE c.id = activity_logs.client_id AND c.organization_id = $1)`
+	err = r.DB.QueryRowContext(ctx, r.DB.Adapt(`SELECT COUNT(*) FROM activity_logs WHERE `+scopeFilter), organizationID).Scan(&totalLogs)
+	if err != nil {
+		return 0, 0, err
+	}
+	err = r.DB.QueryRowContext(ctx, r.DB.Adapt(`SELECT COUNT(*) FROM activity_logs WHERE status = 'Failed' AND `+scopeFilter), organizationID).Scan(&failedLogs)
 	return totalLogs, failedLogs, err
 }
 
 func (r *SQLAnalyticsRepository) GetAvgLatency(ctx context.Context) (float64, error) {
+	organizationID, err := tenant.RequireOrganizationID(ctx)
+	if err != nil {
+		return 0, err
+	}
 	var avg float64
-	err := r.DB.QueryRowContext(ctx,
-		`SELECT COALESCE(AVG(latency_ms), 0) FROM activity_logs WHERE latency_ms > 0`,
+	err = r.DB.QueryRowContext(ctx, r.DB.Adapt(`
+		SELECT COALESCE(AVG(latency_ms), 0) FROM activity_logs
+		WHERE latency_ms > 0
+		  AND EXISTS (SELECT 1 FROM clients c WHERE c.id = activity_logs.client_id AND c.organization_id = $1)`),
+		organizationID,
 	).Scan(&avg)
 	return avg, err
 }
 
 func (r *SQLAnalyticsRepository) GetTrends(ctx context.Context, period, clientID string) ([]TrendDataPoint, error) {
-	var query string
-	var args []interface{}
-	var filter string
-
+	organizationID, err := tenant.RequireOrganizationID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	args := []interface{}{organizationID}
+	filter := `
+		  AND EXISTS (SELECT 1 FROM clients c WHERE c.id = activity_logs.client_id AND c.organization_id = $1)`
 	if clientID != "" {
-		filter = " AND client_id = $1 "
+		filter += ` AND client_id = $2`
 		args = append(args, clientID)
 	}
 
+	var query string
 	if r.DB.IsSQLite() {
 		if period == "30d" {
 			query = `
 				SELECT
 					'Week ' || CAST(CEIL(CAST(strftime('%j', created_at) AS REAL) / 7) AS INTEGER) AS label,
-					SUM(CASE WHEN channel = 'web'      THEN 1 ELSE 0 END) AS web_chat,
+					SUM(CASE WHEN channel = 'web' THEN 1 ELSE 0 END) AS web_chat,
 					SUM(CASE WHEN channel = 'whatsapp' THEN 1 ELSE 0 END) AS wa
 				FROM activity_logs
 				WHERE created_at >= datetime('now', '-30 days')` + filter + `
-				GROUP BY 1
-				ORDER BY MIN(created_at)`
+				GROUP BY 1 ORDER BY MIN(created_at)`
 		} else {
 			query = `
 				SELECT
 					CASE strftime('%w', created_at)
 						WHEN '0' THEN 'Sun' WHEN '1' THEN 'Mon' WHEN '2' THEN 'Tue'
 						WHEN '3' THEN 'Wed' WHEN '4' THEN 'Thu' WHEN '5' THEN 'Fri'
-						ELSE 'Sat'
-					END AS label,
-					SUM(CASE WHEN channel = 'web'      THEN 1 ELSE 0 END) AS web_chat,
+						ELSE 'Sat' END AS label,
+					SUM(CASE WHEN channel = 'web' THEN 1 ELSE 0 END) AS web_chat,
 					SUM(CASE WHEN channel = 'whatsapp' THEN 1 ELSE 0 END) AS wa
 				FROM activity_logs
 				WHERE created_at >= datetime('now', '-7 days')` + filter + `
-				GROUP BY strftime('%Y-%m-%d', created_at)
-				ORDER BY MIN(created_at)`
+				GROUP BY strftime('%Y-%m-%d', created_at) ORDER BY MIN(created_at)`
 		}
+	} else if period == "30d" {
+		query = `
+			SELECT
+				'Week ' || CEIL(EXTRACT(DOY FROM created_at)::float / 7)::int AS label,
+				SUM(CASE WHEN channel = 'web' THEN 1 ELSE 0 END) AS web_chat,
+				SUM(CASE WHEN channel = 'whatsapp' THEN 1 ELSE 0 END) AS wa
+			FROM activity_logs
+			WHERE created_at >= NOW() - INTERVAL '30 days'` + filter + `
+			GROUP BY 1 ORDER BY MIN(created_at)`
 	} else {
-		if period == "30d" {
-			argSign := "$1"
-			if clientID == "" {
-				argSign = ""
-			}
-			query = `
-				SELECT
-					'Week ' || CEIL(EXTRACT(DOY FROM created_at)::float / 7)::int AS label,
-					SUM(CASE WHEN channel = 'web'       THEN 1 ELSE 0 END) AS web_chat,
-					SUM(CASE WHEN channel = 'whatsapp'  THEN 1 ELSE 0 END) AS wa
-				FROM activity_logs
-				WHERE created_at >= NOW() - INTERVAL '30 days'` + strings.Replace(filter, "$1", argSign, 1) + `
-				GROUP BY 1
-				ORDER BY MIN(created_at)`
-		} else {
-			argSign := "$1"
-			if clientID == "" {
-				argSign = ""
-			}
-			query = `
-				SELECT
-					TO_CHAR(created_at, 'Dy') AS label,
-					SUM(CASE WHEN channel = 'web'       THEN 1 ELSE 0 END) AS web_chat,
-					SUM(CASE WHEN channel = 'whatsapp'  THEN 1 ELSE 0 END) AS wa
-				FROM activity_logs
-				WHERE created_at >= NOW() - INTERVAL '7 days'` + strings.Replace(filter, "$1", argSign, 1) + `
-				GROUP BY 1, DATE_TRUNC('day', created_at)
-				ORDER BY DATE_TRUNC('day', created_at)`
-		}
+		query = `
+			SELECT TO_CHAR(created_at, 'Dy') AS label,
+				SUM(CASE WHEN channel = 'web' THEN 1 ELSE 0 END) AS web_chat,
+				SUM(CASE WHEN channel = 'whatsapp' THEN 1 ELSE 0 END) AS wa
+			FROM activity_logs
+			WHERE created_at >= NOW() - INTERVAL '7 days'` + filter + `
+			GROUP BY 1, DATE_TRUNC('day', created_at) ORDER BY DATE_TRUNC('day', created_at)`
 	}
 
 	rows, err := r.DB.QueryContext(ctx, r.DB.Adapt(query), args...)
@@ -187,11 +195,16 @@ func (r *SQLAnalyticsRepository) GetTrends(ctx context.Context, period, clientID
 }
 
 func (r *SQLAnalyticsRepository) GetRecentActivity(ctx context.Context, limit int) ([]models.ActivityLog, error) {
+	organizationID, err := tenant.RequireOrganizationID(ctx)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := r.DB.QueryContext(ctx, r.DB.Adapt(`
 		SELECT id, client_id, client_name, channel, user_ref, message, status, latency_ms, created_at
 		FROM activity_logs
+		WHERE EXISTS (SELECT 1 FROM clients c WHERE c.id = activity_logs.client_id AND c.organization_id = $1)
 		ORDER BY created_at DESC
-		LIMIT $1`), limit,
+		LIMIT $2`), organizationID, limit,
 	)
 	if err != nil {
 		return nil, err
@@ -221,22 +234,35 @@ func (r *SQLAnalyticsRepository) GetRecentActivity(ctx context.Context, limit in
 }
 
 func (r *SQLAnalyticsRepository) QueryClientsForExport(ctx context.Context) (*sql.Rows, error) {
-	return r.DB.QueryContext(ctx,
-		`SELECT id, name, domain, status, provider, model, billing_plan, created_at FROM clients ORDER BY created_at DESC`,
-	)
+	organizationID, err := tenant.RequireOrganizationID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return r.DB.QueryContext(ctx, r.DB.Adapt(`
+		SELECT id, name, domain, status, provider, model, billing_plan, created_at
+		FROM clients WHERE organization_id = $1 ORDER BY created_at DESC`), organizationID)
 }
 
 func (r *SQLAnalyticsRepository) QueryInvoicesForExport(ctx context.Context) (*sql.Rows, error) {
-	return r.DB.QueryContext(ctx,
-		`SELECT id, client_name, amount, status, COALESCE(due_date,''), created_at FROM invoices ORDER BY created_at DESC`,
-	)
+	organizationID, err := tenant.RequireOrganizationID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return r.DB.QueryContext(ctx, r.DB.Adapt(`
+		SELECT i.id, i.client_name, i.amount, i.status, COALESCE(i.due_date,''), i.created_at
+		FROM invoices i JOIN clients c ON c.id = i.client_id
+		WHERE c.organization_id = $1 ORDER BY i.created_at DESC`), organizationID)
 }
 
 func (r *SQLAnalyticsRepository) QueryActivityLogsForExport(ctx context.Context) (*sql.Rows, error) {
-	return r.DB.QueryContext(ctx,
-		`SELECT id, client_name, channel, user_ref, message, status, latency_ms, created_at
-		 FROM activity_logs ORDER BY created_at DESC LIMIT 5000`,
-	)
+	organizationID, err := tenant.RequireOrganizationID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return r.DB.QueryContext(ctx, r.DB.Adapt(`
+		SELECT a.id, a.client_name, a.channel, a.user_ref, a.message, a.status, a.latency_ms, a.created_at
+		FROM activity_logs a JOIN clients c ON c.id = a.client_id
+		WHERE c.organization_id = $1 ORDER BY a.created_at DESC LIMIT 5000`), organizationID)
 }
 
 // GetTopQuestions returns the most frequent user queries.
@@ -245,28 +271,34 @@ func (r *SQLAnalyticsRepository) GetTopQuestions(ctx context.Context, clientID s
 		limit = 10
 	}
 
+	organizationID, err := tenant.RequireOrganizationID(ctx)
+	if err != nil {
+		return nil, err
+	}
 	var query string
 	var args []interface{}
 	if clientID != "" {
 		query = `
 			SELECT message, COUNT(*) as cnt
 			FROM activity_logs
-			WHERE client_id = $1 AND message != '' AND is_ticket = 0
+			WHERE EXISTS (SELECT 1 FROM clients c WHERE c.id = activity_logs.client_id AND c.organization_id = $1)
+			  AND client_id = $2 AND message != '' AND is_ticket = 0
 			GROUP BY message
 			ORDER BY cnt DESC
-			LIMIT $2
+			LIMIT $3
 		`
-		args = []interface{}{clientID, limit}
+		args = []interface{}{organizationID, clientID, limit}
 	} else {
 		query = `
 			SELECT message, COUNT(*) as cnt
 			FROM activity_logs
-			WHERE message != '' AND is_ticket = 0
+			WHERE EXISTS (SELECT 1 FROM clients c WHERE c.id = activity_logs.client_id AND c.organization_id = $1)
+			  AND message != '' AND is_ticket = 0
 			GROUP BY message
 			ORDER BY cnt DESC
-			LIMIT $1
+			LIMIT $2
 		`
-		args = []interface{}{limit}
+		args = []interface{}{organizationID, limit}
 	}
 
 	rows, err := r.DB.QueryContext(ctx, r.DB.Adapt(query), args...)
@@ -292,6 +324,10 @@ func (r *SQLAnalyticsRepository) GetFailedQueries(ctx context.Context, clientID 
 		limit = 20
 	}
 
+	organizationID, err := tenant.RequireOrganizationID(ctx)
+	if err != nil {
+		return nil, err
+	}
 	var query string
 	var args []interface{}
 	if clientID != "" {
@@ -299,21 +335,23 @@ func (r *SQLAnalyticsRepository) GetFailedQueries(ctx context.Context, clientID 
 			SELECT id, client_id, client_name, channel, user_ref, session_id, message,
 			       COALESCE(ai_response,''), status, latency_ms, created_at
 			FROM activity_logs
-			WHERE client_id = $1 AND status = 'Failed'
+			WHERE EXISTS (SELECT 1 FROM clients c WHERE c.id = activity_logs.client_id AND c.organization_id = $1)
+			  AND client_id = $2 AND status = 'Failed'
 			ORDER BY created_at DESC
-			LIMIT $2
+			LIMIT $3
 		`
-		args = []interface{}{clientID, limit}
+		args = []interface{}{organizationID, clientID, limit}
 	} else {
 		query = `
 			SELECT id, client_id, client_name, channel, user_ref, session_id, message,
 			       COALESCE(ai_response,''), status, latency_ms, created_at
 			FROM activity_logs
 			WHERE status = 'Failed'
+			  AND EXISTS (SELECT 1 FROM clients c WHERE c.id = activity_logs.client_id AND c.organization_id = $1)
 			ORDER BY created_at DESC
-			LIMIT $1
+			LIMIT $2
 		`
-		args = []interface{}{limit}
+		args = []interface{}{organizationID, limit}
 	}
 
 	rows, err := r.DB.QueryContext(ctx, r.DB.Adapt(query), args...)
@@ -339,31 +377,38 @@ func (r *SQLAnalyticsRepository) GetFailedQueries(ctx context.Context, clientID 
 
 // GetSatisfactionStats computes feedback statistics from reactions (thumbs_up / thumbs_down).
 func (r *SQLAnalyticsRepository) GetSatisfactionStats(ctx context.Context, clientID string) (*SatisfactionStats, error) {
+	organizationID, err := tenant.RequireOrganizationID(ctx)
+	if err != nil {
+		return nil, err
+	}
 	var query string
 	var args []interface{}
 	if clientID != "" {
 		query = `
 			SELECT
 				COUNT(*) as total,
-				SUM(CASE WHEN reaction = 'ðŸ‘' OR reaction = 'positive' THEN 1 ELSE 0 END) as pos,
-				SUM(CASE WHEN reaction = 'ðŸ‘Ž' OR reaction = 'negative' THEN 1 ELSE 0 END) as neg
+				SUM(CASE WHEN reaction = '👍' OR reaction = 'positive' THEN 1 ELSE 0 END) as pos,
+				SUM(CASE WHEN reaction = '👎' OR reaction = 'negative' THEN 1 ELSE 0 END) as neg
 			FROM activity_logs
-			WHERE client_id = $1 AND reaction IS NOT NULL AND reaction != ''
+			WHERE EXISTS (SELECT 1 FROM clients c WHERE c.id = activity_logs.client_id AND c.organization_id = $1)
+			  AND client_id = $2 AND reaction IS NOT NULL AND reaction != ''
 		`
-		args = []interface{}{clientID}
+		args = []interface{}{organizationID, clientID}
 	} else {
 		query = `
 			SELECT
 				COUNT(*) as total,
-				SUM(CASE WHEN reaction = 'ðŸ‘' OR reaction = 'positive' THEN 1 ELSE 0 END) as pos,
-				SUM(CASE WHEN reaction = 'ðŸ‘Ž' OR reaction = 'negative' THEN 1 ELSE 0 END) as neg
+				SUM(CASE WHEN reaction = '👍' OR reaction = 'positive' THEN 1 ELSE 0 END) as pos,
+				SUM(CASE WHEN reaction = '👎' OR reaction = 'negative' THEN 1 ELSE 0 END) as neg
 			FROM activity_logs
 			WHERE reaction IS NOT NULL AND reaction != ''
+			  AND EXISTS (SELECT 1 FROM clients c WHERE c.id = activity_logs.client_id AND c.organization_id = $1)
 		`
+		args = []interface{}{organizationID}
 	}
 
 	var total, pos, neg sql.NullInt64
-	err := r.DB.QueryRowContext(ctx, r.DB.Adapt(query), args...).Scan(&total, &pos, &neg)
+	err = r.DB.QueryRowContext(ctx, r.DB.Adapt(query), args...).Scan(&total, &pos, &neg)
 	if err != nil {
 		return &SatisfactionStats{SatisfactionPct: 100.0}, nil
 	}
@@ -384,4 +429,3 @@ func (r *SQLAnalyticsRepository) GetSatisfactionStats(ctx context.Context, clien
 		SatisfactionPct: pct,
 	}, nil
 }
-

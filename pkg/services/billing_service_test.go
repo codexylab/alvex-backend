@@ -1,4 +1,4 @@
-﻿package services
+package services
 
 import (
 	"testing"
@@ -32,18 +32,5 @@ func TestClientMonthlyCost(t *testing.T) {
 	}
 	if customClient.MonthlyCost() != 150.00 {
 		t.Errorf("Custom rate expected 150.00, got %f", customClient.MonthlyCost())
-	}
-}
-
-func TestMaskedAPIKey(t *testing.T) {
-	c := &models.Client{APIKey: "ALVX-NEXD-8921xab3c4f2d"}
-	masked := c.MaskedAPIKey()
-	if masked != "ALVX-NEXDâ€¢â€¢â€¢â€¢" {
-		t.Errorf("MaskedAPIKey() = %q; want %q", masked, "ALVX-NEXDâ€¢â€¢â€¢â€¢")
-	}
-
-	short := &models.Client{APIKey: "short"}
-	if short.MaskedAPIKey() != "â€¢â€¢â€¢â€¢â€¢â€¢â€¢â€¢" {
-		t.Errorf("MaskedAPIKey() for short key = %q; want %q", short.MaskedAPIKey(), "â€¢â€¢â€¢â€¢â€¢â€¢â€¢â€¢")
 	}
 }

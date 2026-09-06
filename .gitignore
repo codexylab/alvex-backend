@@ -28,6 +28,7 @@ debug_full.txt
 
 # Go build cache
 /vendor/
+.gocache/
 
 # IDE files
 .vscode/
