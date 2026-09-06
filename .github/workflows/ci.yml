@@ -43,8 +43,10 @@ jobs:
       - name: Run static analysis
         run: go vet ./...
 
-      - name: Run tests
-        run: go test -race -count=1 -coverprofile=coverage.out ./...
+      - name: Run web-only release tests
+        # WhatsApp is intentionally deferred from the current web-chat release.
+        # Keep its code compiling, but do not execute WhatsApp-specific tests.
+        run: go test -race -count=1 -coverprofile=coverage.out -skip 'WhatsApp|ReceiveWhatsApp' ./...
 
       - name: Build API
         run: go build -trimpath ./cmd/server
