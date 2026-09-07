@@ -169,11 +169,11 @@ func (c *Config) ValidateRuntime() error {
 			problems = append(problems, "WHATSAPP_GRAPH_API_BASE_URL must be a valid HTTPS URL")
 		}
 	}
-	if c.StripeWebhookSecret != "" && c.StripeSecretKey == "" {
-		problems = append(problems, "STRIPE_SECRET_KEY is required when STRIPE_WEBHOOK_SECRET is configured")
-	}
-	if (c.StripePriceBasic != "" || c.StripePricePro != "" || c.StripePriceEnterprise != "") && c.StripeSecretKey == "" {
-		problems = append(problems, "STRIPE_SECRET_KEY is required when Stripe Price IDs are configured")
+	stripeConfigured := c.StripeSecretKey != "" || c.StripeWebhookSecret != "" ||
+		c.StripePriceBasic != "" || c.StripePricePro != "" || c.StripePriceEnterprise != ""
+	if stripeConfigured && (c.StripeSecretKey == "" || c.StripeWebhookSecret == "" ||
+		c.StripePriceBasic == "" || c.StripePricePro == "" || c.StripePriceEnterprise == "") {
+		problems = append(problems, "Stripe configuration must include the secret, webhook secret, and all subscription Price IDs")
 	}
 
 	for _, origin := range c.AllowedOrigins {
@@ -199,10 +199,6 @@ func (c *Config) ValidateRuntime() error {
 		}
 		if c.PublicAPIURL == "" {
 			problems = append(problems, "PUBLIC_API_URL is required in staging and production")
-		}
-		if c.StripeSecretKey == "" || c.StripeWebhookSecret == "" ||
-			c.StripePriceBasic == "" || c.StripePricePro == "" || c.StripePriceEnterprise == "" {
-			problems = append(problems, "Stripe secret, webhook secret, and all subscription Price IDs are required in staging and production")
 		}
 	}
 

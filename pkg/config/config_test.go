@@ -13,6 +13,29 @@ func TestValidateRuntimeAcceptsSafeProductionConfig(t *testing.T) {
 	}
 }
 
+func TestValidateRuntimeAcceptsProductionWithoutOptionalStripe(t *testing.T) {
+	cfg := productionConfig()
+	cfg.StripeSecretKey = ""
+	cfg.StripeWebhookSecret = ""
+	cfg.StripePriceBasic = ""
+	cfg.StripePricePro = ""
+	cfg.StripePriceEnterprise = ""
+
+	if err := cfg.ValidateRuntime(); err != nil {
+		t.Fatalf("expected Stripe-free web-chat configuration to be valid, got %v", err)
+	}
+}
+
+func TestValidateRuntimeRejectsPartialStripeConfiguration(t *testing.T) {
+	cfg := productionConfig()
+	cfg.StripeWebhookSecret = ""
+
+	err := cfg.ValidateRuntime()
+	if err == nil || !strings.Contains(err.Error(), "Stripe configuration must include") {
+		t.Fatalf("expected partial Stripe configuration error, got %v", err)
+	}
+}
+
 func TestValidateRuntimeRejectsIncompleteProductionSecrets(t *testing.T) {
 	cfg := productionConfig()
 	cfg.EncryptionKey = "short"
