@@ -1,32 +1,42 @@
-﻿package services
+package services
 
 import (
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
-	"log/slog"
+	"net/url"
 	"strings"
 	"time"
 
+	"github.com/codexylab/alvex-backend/pkg/apierr"
+	"github.com/codexylab/alvex-backend/pkg/crypto"
 	"github.com/codexylab/alvex-backend/pkg/models"
 	"github.com/codexylab/alvex-backend/pkg/repository"
 	"github.com/codexylab/alvex-backend/pkg/services/scraper"
-	"github.com/codexylab/alvex-backend/pkg/apierr"
-	"github.com/codexylab/alvex-backend/pkg/crypto"
 )
 
 // ClientService manages the business logic for client configuration.
 type ClientService struct {
-	Repo          repository.ClientRepository
-	EncryptionKey string
+	Repo                   repository.ClientRepository
+	EncryptionKey          string
+	PreviousEncryptionKeys []string
+	PublicAPIURL           string
+}
+
+// WithPreviousEncryptionKeys enables decrypt-only compatibility during a
+// controlled encryption key rotation.
+func (s *ClientService) WithPreviousEncryptionKeys(keys []string) *ClientService {
+	s.PreviousEncryptionKeys = append([]string(nil), keys...)
+	return s
 }
 
 // NewClientService creates a new ClientService instance.
-func NewClientService(repo repository.ClientRepository, encKey string) *ClientService {
+func NewClientService(repo repository.ClientRepository, encKey, publicAPIURL string) *ClientService {
 	return &ClientService{
 		Repo:          repo,
 		EncryptionKey: encKey,
+		PublicAPIURL:  publicAPIURL,
 	}
 }
 
@@ -35,40 +45,79 @@ func (s *ClientService) List(ctx context.Context, search, status string, page, l
 	return s.Repo.List(ctx, search, status, page, limit)
 }
 
-// GetByID returns a single client profile with its decrypted main API key.
+// GetByID returns a client profile with write-only provider credentials loaded
+// for service use. JSON transport redaction prevents these values from leaving
+// the backend.
 func (s *ClientService) GetByID(ctx context.Context, id string) (*models.Client, error) {
 	c, err := s.Repo.GetByID(ctx, id)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || strings.Contains(err.Error(), "no rows") {
+			return nil, fmt.Errorf("%w: client not found", apierr.ErrNotFound)
+		}
 		return nil, err
 	}
 
-	// Decrypt the main API key
-	if s.EncryptionKey != "" && c.APIKey != "" {
-		c.APIKey = crypto.DecryptAPIKey(s.EncryptionKey, c.APIKey)
+	rotationFields := make(map[string]interface{})
+	c.OpenAIAPIKey, err = s.decryptClientSecret(c.OpenAIAPIKey, "OpenAI API key", "openai_api_key", rotationFields)
+	if err != nil {
+		return nil, err
 	}
-
-	// Decrypt gemini_api_key
-	if c.GeminiAPIKey != "" {
-		if s.EncryptionKey != "" {
-			c.GeminiAPIKey = crypto.DecryptAPIKey(s.EncryptionKey, c.GeminiAPIKey)
-		}
+	c.GeminiAPIKey, err = s.decryptClientSecret(c.GeminiAPIKey, "Gemini API key", "gemini_api_key", rotationFields)
+	if err != nil {
+		return nil, err
 	}
-
-	// Decrypt groq_api_key
-	if c.GroqAPIKey != "" {
-		if s.EncryptionKey != "" {
-			c.GroqAPIKey = crypto.DecryptAPIKey(s.EncryptionKey, c.GroqAPIKey)
+	c.GroqAPIKey, err = s.decryptClientSecret(c.GroqAPIKey, "Groq API key", "groq_api_key", rotationFields)
+	if err != nil {
+		return nil, err
+	}
+	if len(rotationFields) > 0 {
+		rotationFields["updated_at"] = time.Now().UTC()
+		if _, err := s.Repo.UpdateFields(ctx, id, rotationFields); err != nil {
+			return nil, fmt.Errorf("persist rotated client secrets: %w", err)
 		}
 	}
 
 	return c, nil
 }
 
-// Create generates credentials and saves a new client profile.
+func (s *ClientService) decryptClientSecret(
+	storedValue string,
+	label string,
+	column string,
+	rotationFields map[string]interface{},
+) (string, error) {
+	if storedValue == "" || s.EncryptionKey == "" {
+		return storedValue, nil
+	}
+	plaintext, usedPreviousKey, err := crypto.DecryptAPIKeyWithKeyring(
+		s.EncryptionKey,
+		s.PreviousEncryptionKeys,
+		storedValue,
+	)
+	if err != nil {
+		return "", fmt.Errorf("decrypt %s: %w", label, err)
+	}
+	if usedPreviousKey || !crypto.IsVersionedCiphertext(storedValue) {
+		rotatedValue, err := crypto.EncryptAPIKey(s.EncryptionKey, plaintext)
+		if err != nil {
+			return "", fmt.Errorf("re-encrypt %s: %w", label, err)
+		}
+		rotationFields[column] = rotatedValue
+	}
+	return plaintext, nil
+}
+
+// Create saves a client profile. Machine credentials are created separately
+// through APIKeyService so they are hashed, scoped, expirable, and revocable.
 func (s *ClientService) Create(ctx context.Context, req models.CreateClientRequest, ownerID string) (*models.Client, error) {
 	if req.Name == "" || req.Domain == "" {
 		return nil, fmt.Errorf("name and domain are required")
 	}
+	normalizedDomain, err := scraper.NormalizeWebsiteURL(req.Domain)
+	if err != nil {
+		return nil, &apierr.ValidationError{Message: "domain must be a valid public HTTP or HTTPS website URL"}
+	}
+	req.Domain = normalizedDomain
 
 	// Generate a URL-safe slug ID from the client name
 	id := crypto.SlugifyClientName(req.Name)
@@ -84,6 +133,10 @@ func (s *ClientService) Create(ctx context.Context, req models.CreateClientReque
 	if exists {
 		return nil, fmt.Errorf("duplicate: client with ID %q already exists", id)
 	}
+	allowedOrigins, err := validateAllowedOrigins(req.AllowedOrigins)
+	if err != nil {
+		return nil, err
+	}
 
 	// Validate model
 	validModels := models.ProviderModels[req.Provider]
@@ -91,44 +144,33 @@ func (s *ClientService) Create(ctx context.Context, req models.CreateClientReque
 		return nil, fmt.Errorf("model %q is not valid for provider %q", req.Model, req.Provider)
 	}
 
-	apiKey := crypto.GenerateAPIKey(req.Name)
-	webhookURL := crypto.GenerateWebhookURL(id)
-	portalToken := crypto.GeneratePortalToken()
+	webhookURL := crypto.GenerateWebhookURL(s.PublicAPIURL, id)
 	systemPersona := fmt.Sprintf(
 		"You are an AI representative for %s. Help visitors with inquiries on %s.\n\nTONE: Friendly and professional.",
 		req.Name, req.Domain,
 	)
 
-	// Encrypt API key
-	apiKeyToStore := apiKey
-	if s.EncryptionKey != "" {
-		if encrypted, err := crypto.EncryptAPIKey(s.EncryptionKey, apiKey); err == nil {
-			apiKeyToStore = encrypted
-		}
-	}
-
 	c := &models.Client{
-		ID:                  id,
-		Name:                req.Name,
-		Domain:              req.Domain,
-		Status:              models.ClientStatusActive,
-		Provider:            req.Provider,
-		Model:               req.Model,
-		APIKey:              apiKeyToStore,
-		SystemPersona:       systemPersona,
-		WebhookURL:          webhookURL,
-		Temperature:         0.7,
-		StrictAdherence:     true,
-		BillingPlan:         req.BillingPlan,
-		PortalToken:         portalToken,
-		OwnerID:             &ownerID,
-		WidgetChatEnabled:   true,
-		WidgetTicketingEnabled: true,
-		WidgetAdminMsgEnabled:   true,
+		ID:                       id,
+		Name:                     req.Name,
+		Domain:                   req.Domain,
+		AllowedOrigins:           allowedOrigins,
+		Status:                   models.ClientStatusActive,
+		Provider:                 req.Provider,
+		Model:                    req.Model,
+		SystemPersona:            systemPersona,
+		WebhookURL:               webhookURL,
+		Temperature:              0.7,
+		StrictAdherence:          true,
+		BillingPlan:              req.BillingPlan,
+		OwnerID:                  &ownerID,
+		WidgetChatEnabled:        true,
+		WidgetTicketingEnabled:   true,
+		WidgetAdminMsgEnabled:    true,
 		WidgetImageSearchEnabled: true,
 		WidgetTicketingAllowed:   true,
-		WidgetAdminMsgAllowed:     true,
-		WidgetImageSearchAllowed:   true,
+		WidgetAdminMsgAllowed:    true,
+		WidgetImageSearchAllowed: true,
 	}
 
 	if err := s.Repo.Create(ctx, c); err != nil {
@@ -142,8 +184,13 @@ func (s *ClientService) Create(ctx context.Context, req models.CreateClientReque
 // Update compiles configuration changes, encrypts secrets, and updates the client profile.
 func (s *ClientService) Update(ctx context.Context, id string, req models.UpdateClientRequest) (*models.Client, string, error) {
 	var domainToSync string
-	if req.Domain != nil && *req.Domain != "" {
-		domainToSync = *req.Domain
+	if req.Domain != nil {
+		normalizedDomain, err := scraper.NormalizeWebsiteURL(*req.Domain)
+		if err != nil {
+			return nil, "", &apierr.ValidationError{Message: "domain must be a valid public HTTP or HTTPS website URL"}
+		}
+		req.Domain = &normalizedDomain
+		domainToSync = normalizedDomain
 	}
 
 	fields := map[string]interface{}{
@@ -153,26 +200,44 @@ func (s *ClientService) Update(ctx context.Context, id string, req models.Update
 	if req.Domain != nil {
 		fields["domain"] = *req.Domain
 	}
+	if req.AllowedOrigins != nil {
+		allowedOrigins, err := validateAllowedOrigins(*req.AllowedOrigins)
+		if err != nil {
+			return nil, "", err
+		}
+		fields["allowed_origins"] = repository.MarshalStringSlice(allowedOrigins)
+	}
+	if req.WhatsAppPhoneNumberID != nil {
+		phoneNumberID := strings.TrimSpace(*req.WhatsAppPhoneNumberID)
+		if phoneNumberID != "" && !whatsAppPhoneNumberIDPattern.MatchString(phoneNumberID) {
+			return nil, "", &apierr.ValidationError{Message: "whatsapp_phone_number_id must contain digits only"}
+		}
+		fields["whatsapp_phone_number_id"] = phoneNumberID
+	}
 	if req.Provider != nil {
 		fields["provider"] = *req.Provider
 	}
 	if req.Model != nil {
 		fields["model"] = *req.Model
 	}
-	if req.APIKey != nil {
-		keyToStore := *req.APIKey
+	if req.OpenAIAPIKey != nil {
+		keyToStore := *req.OpenAIAPIKey
 		if s.EncryptionKey != "" {
-			if enc, err := crypto.EncryptAPIKey(s.EncryptionKey, *req.APIKey); err == nil {
-				keyToStore = enc
+			var err error
+			keyToStore, err = crypto.EncryptAPIKey(s.EncryptionKey, *req.OpenAIAPIKey)
+			if err != nil {
+				return nil, "", fmt.Errorf("encrypt OpenAI API key: %w", err)
 			}
 		}
-		fields["api_key"] = keyToStore
+		fields["openai_api_key"] = keyToStore
 	}
 	if req.GeminiAPIKey != nil {
 		keyToStore := *req.GeminiAPIKey
 		if s.EncryptionKey != "" {
-			if enc, err := crypto.EncryptAPIKey(s.EncryptionKey, *req.GeminiAPIKey); err == nil {
-				keyToStore = enc
+			var err error
+			keyToStore, err = crypto.EncryptAPIKey(s.EncryptionKey, *req.GeminiAPIKey)
+			if err != nil {
+				return nil, "", fmt.Errorf("encrypt Gemini API key: %w", err)
 			}
 		}
 		fields["gemini_api_key"] = keyToStore
@@ -180,8 +245,10 @@ func (s *ClientService) Update(ctx context.Context, id string, req models.Update
 	if req.GroqAPIKey != nil {
 		keyToStore := *req.GroqAPIKey
 		if s.EncryptionKey != "" {
-			if enc, err := crypto.EncryptAPIKey(s.EncryptionKey, *req.GroqAPIKey); err == nil {
-				keyToStore = enc
+			var err error
+			keyToStore, err = crypto.EncryptAPIKey(s.EncryptionKey, *req.GroqAPIKey)
+			if err != nil {
+				return nil, "", fmt.Errorf("encrypt Groq API key: %w", err)
 			}
 		}
 		fields["groq_api_key"] = keyToStore
@@ -288,18 +355,67 @@ func (s *ClientService) ToggleStatus(ctx context.Context, id string) (string, er
 	if c.Status == models.ClientStatusActive {
 		newStatus = models.ClientStatusSuspended
 	}
+	return s.updateStatus(ctx, id, c.Status, newStatus)
+}
 
-	fields := map[string]interface{}{
-		"status":     newStatus,
-		"updated_at": time.Now(),
-	}
-
-	_, err = s.Repo.UpdateFields(ctx, id, fields)
-	if err != nil {
+// SetStatus applies an explicit desired state. Repeating the same request is
+// idempotent, which is required for reliable bulk operations and retries.
+func (s *ClientService) SetStatus(ctx context.Context, id string, status models.ClientStatus) (string, error) {
+	if err := validateClientStatus(status); err != nil {
 		return "", err
 	}
 
-	return string(newStatus), nil
+	c, err := s.Repo.GetByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || strings.Contains(err.Error(), "no rows") {
+			return "", fmt.Errorf("%w: client not found", apierr.ErrNotFound)
+		}
+		return "", err
+	}
+
+	return s.updateStatus(ctx, id, c.Status, status)
+}
+
+// SetAllStatuses applies one desired state to every client in the current
+// organization in a single tenant-scoped database update.
+func (s *ClientService) SetAllStatuses(ctx context.Context, status models.ClientStatus) (int64, error) {
+	if err := validateClientStatus(status); err != nil {
+		return 0, err
+	}
+	return s.Repo.UpdateAllStatuses(ctx, status, time.Now().UTC())
+}
+
+func validateClientStatus(status models.ClientStatus) error {
+	if status != models.ClientStatusActive && status != models.ClientStatusSuspended {
+		return &apierr.ValidationError{Message: "status must be Active or Suspended"}
+	}
+	return nil
+}
+
+func (s *ClientService) updateStatus(
+	ctx context.Context,
+	id string,
+	currentStatus models.ClientStatus,
+	desiredStatus models.ClientStatus,
+) (string, error) {
+	if currentStatus == desiredStatus {
+		return string(desiredStatus), nil
+	}
+
+	fields := map[string]interface{}{
+		"status":     desiredStatus,
+		"updated_at": time.Now(),
+	}
+
+	rowsAffected, err := s.Repo.UpdateFields(ctx, id, fields)
+	if err != nil {
+		return "", err
+	}
+	if rowsAffected == 0 {
+		return "", fmt.Errorf("%w: client not found", apierr.ErrNotFound)
+	}
+
+	return string(desiredStatus), nil
 }
 
 // Delete deletes a suspended client.
@@ -326,57 +442,6 @@ func (s *ClientService) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-// RotateToken regenerates the secure access portal token.
-func (s *ClientService) RotateToken(ctx context.Context, id string) (*models.Client, error) {
-	exists, err := s.Repo.ExistsByID(ctx, id)
-	if err != nil || !exists {
-		return nil, fmt.Errorf("%w: client not found", apierr.ErrNotFound)
-	}
-
-	newToken := crypto.GeneratePortalToken()
-	fields := map[string]interface{}{
-		"portal_token": newToken,
-		"updated_at":   time.Now(),
-	}
-
-	_, err = s.Repo.UpdateFields(ctx, id, fields)
-	if err != nil {
-		return nil, err
-	}
-
-	return s.GetByID(ctx, id)
-}
-
-// RotateAPIKey generates a new platform API key for the client, invalidating the old one.
-func (s *ClientService) RotateAPIKey(ctx context.Context, id, rotatedBy string) (*models.Client, error) {
-	c, err := s.Repo.GetByID(ctx, id)
-	if err != nil {
-		return nil, fmt.Errorf("%w: client not found", apierr.ErrNotFound)
-	}
-
-	newRawKey := crypto.GenerateAPIKey(c.Name)
-	encKey := newRawKey
-	if s.EncryptionKey != "" {
-		var encErr error
-		encKey, encErr = crypto.EncryptAPIKey(s.EncryptionKey, newRawKey)
-		if encErr != nil {
-			return nil, fmt.Errorf("failed to encrypt new API key: %w", encErr)
-		}
-	}
-
-	fields := map[string]interface{}{
-		"api_key":    encKey,
-		"updated_at": time.Now(),
-	}
-
-	_, err = s.Repo.UpdateFields(ctx, id, fields)
-	if err != nil {
-		return nil, err
-	}
-
-	return s.GetByID(ctx, id)
-}
-
 // Helper functions
 
 func containsString(slice []string, item string) bool {
@@ -388,14 +453,40 @@ func containsString(slice []string, item string) bool {
 	return false
 }
 
+func validateAllowedOrigins(values []string) ([]string, error) {
+	if len(values) > 20 {
+		return nil, &apierr.ValidationError{Message: "allowed_origins cannot contain more than 20 entries"}
+	}
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		parsed, err := url.Parse(strings.TrimSpace(value))
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" ||
+			parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return nil, &apierr.ValidationError{Message: fmt.Sprintf(
+				"allowed origin %q must contain only an HTTP or HTTPS scheme and host",
+				value,
+			)}
+		}
+		normalized := strings.ToLower(parsed.Scheme + "://" + parsed.Host)
+		if _, exists := seen[normalized]; exists {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		result = append(result, normalized)
+	}
+	return result, nil
+}
+
 // FAQGenerator defines the interface for generating FAQs from scraped content.
 type FAQGenerator interface {
 	GenerateFAQsFromText(ctx context.Context, clientID string, scrapedContent string) error
 }
 
-// ScrapeAndSave runs the website scraper for a client and saves the clean text content in the database.
-func (s *ClientService) ScrapeAndSave(ctx context.Context, clientID string, domain string, faqGen FAQGenerator) (string, *time.Time, error) {
-	scrapedText, err := scraper.ScrapeWebsite(domain)
+// ScrapeAndSave runs the website scraper and persists clean source text. RAG
+// indexing and FAQ generation are separate durable job steps.
+func (s *ClientService) ScrapeAndSave(ctx context.Context, clientID string, domain string) (string, *time.Time, error) {
+	scrapedText, err := scraper.ScrapeWebsite(ctx, domain)
 	if err != nil {
 		return "", nil, err
 	}
@@ -412,31 +503,44 @@ func (s *ClientService) ScrapeAndSave(ctx context.Context, clientID string, doma
 		return "", nil, err
 	}
 
-	// Trigger FAQ draft generation from scraped content in background
-	if faqGen != nil {
-		go func(cid, text string) {
-			bgCtx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
-			defer cancel()
-			_ = faqGen.GenerateFAQsFromText(bgCtx, cid, text)
-		}(clientID, scrapedText)
-	}
-
 	return scrapedText, &now, nil
 }
 
-// AutoSyncClientWebsites checks which clients are due for a scraped website sync,
-// scrapes their content, and generates FAQ drafts. Iterates through all pages
-// to handle more than 1000 clients.
-func (s *ClientService) AutoSyncClientWebsites(ctx context.Context, faqGen FAQGenerator) {
-	now := time.Now()
+func (s *ClientService) UpdateOnboardingStatus(ctx context.Context, clientID, status string) error {
+	if status != "processing" && status != "complete" && status != "failed" {
+		return fmt.Errorf("invalid onboarding status %q", status)
+	}
+	result, err := s.Repo.UpdateFields(ctx, clientID, map[string]interface{}{
+		"onboarding_status": status,
+		"updated_at":        time.Now().UTC(),
+	})
+	if err != nil {
+		return err
+	}
+	if result == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// QueueDueWebsiteSyncs enqueues due website refreshes without starting
+// untracked goroutines. It iterates through all pages for large installations.
+func (s *ClientService) QueueDueWebsiteSyncs(
+	ctx context.Context,
+	scheduler *WebsiteIndexScheduler,
+	now time.Time,
+) (int, error) {
+	if scheduler == nil {
+		return 0, fmt.Errorf("website sync scheduler is not configured")
+	}
 	page := 1
 	const pageSize = 100
+	queued := 0
 
 	for {
 		clients, total, err := s.Repo.List(ctx, "", "", page, pageSize)
 		if err != nil {
-			slog.Error("failed to list clients for auto-sync", "error", err)
-			return
+			return queued, fmt.Errorf("list clients for auto-sync: %w", err)
 		}
 
 		for _, c := range clients {
@@ -455,17 +559,11 @@ func (s *ClientService) AutoSyncClientWebsites(ctx context.Context, faqGen FAQGe
 			}
 
 			if shouldSync {
-				slog.Info("starting auto-sync for client website", "client_id", c.ID, "domain", c.Domain)
-				go func(cid, dom string) {
-					bgCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-					defer cancel()
-					_, _, err := s.ScrapeAndSave(bgCtx, cid, dom, faqGen)
-					if err != nil {
-						slog.Warn("auto-sync failed for client website", "client_id", cid, "error", err)
-					} else {
-						slog.Info("auto-sync completed for client website", "client_id", cid)
-					}
-				}(c.ID, c.Domain)
+				key := fmt.Sprintf("%s:%s:%d", WebsiteSyncAutomatic, c.ID, now.UTC().Truncate(time.Hour).Unix())
+				if _, err := scheduler.Enqueue(ctx, c.ID, c.Domain, WebsiteSyncAutomatic, key); err != nil {
+					return queued, fmt.Errorf("queue website sync for client %s: %w", c.ID, err)
+				}
+				queued++
 			}
 		}
 
@@ -474,4 +572,5 @@ func (s *ClientService) AutoSyncClientWebsites(ctx context.Context, faqGen FAQGe
 		}
 		page++
 	}
+	return queued, nil
 }

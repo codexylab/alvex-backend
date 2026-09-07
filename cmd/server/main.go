@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"context"
@@ -30,6 +30,10 @@ func main() {
 
 	// Load configuration from .env or environment variables
 	cfg := config.Load()
+	if err := cfg.ValidateRuntime(); err != nil {
+		slog.Error("runtime configuration validation failed", "error", err)
+		os.Exit(1)
+	}
 
 	// Initialize Sentry error monitoring
 	monitoring.InitMonitoring(cfg.SentryDSN, cfg.Env)
@@ -45,31 +49,49 @@ func main() {
 	}
 	defer db.Close()
 
-	// Run schema migrations â€” create tables if they don't exist
-	if err := db.RunMigrations(); err != nil {
-		slog.Error("migration failed", "error", err)
-		os.Exit(1)
+	// SQLite remains self-initializing for local development. PostgreSQL is
+	// migrated by Railway's pre-deploy command before this process starts.
+	if db.IsSQLite() {
+		if err := db.RunMigrations(); err != nil {
+			slog.Error("local migration failed", "error", err)
+			os.Exit(1)
+		}
+		if err := db.RunColumnMigrations(); err != nil {
+			slog.Error("local column migration failed", "error", err)
+			os.Exit(1)
+		}
 	}
-
-	// Run column migrations â€” add new columns to existing tables safely
-	if err := db.RunColumnMigrations(); err != nil {
-		slog.Error("column migration failed", "error", err)
-		os.Exit(1)
-	}
-
-	// Start asynchronous background chat worker pool
-	workerPool := queue.NewWorkerPool(5, 200)
-	workerPool.Start()
 
 	// Construct repositories and services for background tasks
 	clientRepo := repository.NewSQLClientRepository(db)
 	billingRepo := repository.NewSQLBillingRepository(db)
 	activityRepo := repository.NewSQLActivityRepository(db)
 	chunkRepo := repository.NewSQLChunkRepository(db)
+	widgetSessionRepo := repository.NewSQLWidgetSessionRepository(db)
+	backgroundJobRepo := repository.NewSQLBackgroundJobRepository(db)
+	websiteSyncScheduler := services.NewWebsiteIndexScheduler(backgroundJobRepo)
+	whatsAppDeliveryRepo := repository.NewSQLWhatsAppDeliveryRepository(db)
+	stripeRepo := repository.NewSQLStripeRepository(db)
+	checkoutSignupRepo := repository.NewSQLCheckoutSignupRepository(db)
+	documentRepo := repository.NewSQLDocumentRepository(db)
+	aiUsageRepo := repository.NewSQLAIUsageRepository(db)
+	deadJobAlert := monitoring.NewDeadJobWebhook(cfg.AlertWebhookURL, cfg.Env)
 
 	embeddingSvc := services.NewEmbeddingService(cfg.GeminiAPIKey)
 	ragSvc := services.NewRAGService(chunkRepo, embeddingSvc)
-	clientSvc := services.NewClientService(clientRepo, cfg.EncryptionKey)
+	documentProcessor := &services.DocumentIndexJobProcessor{
+		Documents: documentRepo,
+		RAG:       ragSvc,
+	}
+	documentWorker := queue.NewDurableWorker(
+		backgroundJobRepo,
+		services.DocumentIndexJobType,
+		2,
+		documentProcessor.Process,
+	).WithDeadJobAlert(deadJobAlert)
+	documentWorker.Start()
+	clientSvc := services.NewClientService(clientRepo, cfg.EncryptionKey, cfg.PublicAPIURL).
+		WithPreviousEncryptionKeys(cfg.PreviousEncryptionKeys)
 	billingSvc := services.NewBillingService(billingRepo)
 	portalSvc := services.NewPortalService(
 		repository.NewSQLPortalRepository(db),
@@ -78,7 +100,21 @@ func main() {
 		cfg.OpenAIAPIKey,
 		cfg.GroqAPIKey,
 		cfg.FallbackGeminiKey,
-	)
+	).WithPreviousEncryptionKeys(cfg.PreviousEncryptionKeys).
+		WithAIUsageRepository(aiUsageRepo)
+	websiteProcessor := &services.WebsiteIndexJobProcessor{
+		Jobs:    backgroundJobRepo,
+		Clients: clientSvc,
+		RAG:     ragSvc,
+		FAQs:    portalSvc,
+	}
+	websiteWorker := queue.NewDurableWorker(
+		backgroundJobRepo,
+		services.WebsiteIndexJobType,
+		1,
+		websiteProcessor.Process,
+	).WithDeadJobAlert(deadJobAlert)
+	websiteWorker.Start()
 	chatSvc := services.NewChatService(
 		clientRepo,
 		activityRepo,
@@ -90,7 +126,67 @@ func main() {
 		cfg.OpenAIAPIKey,
 		cfg.GroqAPIKey,
 		cfg.FallbackGeminiKey,
-	)
+	).WithPreviousEncryptionKeys(cfg.PreviousEncryptionKeys).
+		WithAIUsageRepository(aiUsageRepo)
+	var whatsAppWorker *queue.DurableWorker
+	if cfg.WhatsAppAccessToken != "" && cfg.WhatsAppGraphAPIBaseURL != "" {
+		whatsAppProcessor := &services.WhatsAppJobProcessor{
+			Jobs:       backgroundJobRepo,
+			Deliveries: whatsAppDeliveryRepo,
+			Chat:       chatSvc,
+			Sender: services.NewWhatsAppCloudClient(
+				cfg.WhatsAppGraphAPIBaseURL,
+				cfg.WhatsAppAccessToken,
+			),
+		}
+		whatsAppWorker = queue.NewDurableWorker(
+			backgroundJobRepo,
+			services.WhatsAppInboundJobType,
+			2,
+			whatsAppProcessor.Process,
+		).WithDeadJobAlert(deadJobAlert)
+		whatsAppWorker.Start()
+	}
+	var stripeWorker *queue.DurableWorker
+	if cfg.StripeWebhookSecret != "" {
+		stripeService := services.NewStripeService(
+			stripeRepo,
+			stripeRepo,
+			checkoutSignupRepo,
+			backgroundJobRepo,
+			cfg.PublicAPIURL,
+		)
+		stripeWorker = queue.NewDurableWorker(
+			backgroundJobRepo,
+			services.StripeWebhookJobType,
+			2,
+			func(ctx context.Context, job repository.BackgroundJob) error {
+				return stripeService.HandleWebhook(ctx, job.Payload)
+			},
+		).WithDeadJobAlert(deadJobAlert)
+		stripeWorker.Start()
+	}
+
+	// Expired widget credentials are short-lived and removed regularly so the
+	// session table remains bounded without putting cleanup work on requests.
+	go func() {
+		cleanup := func() {
+			deleted, err := widgetSessionRepo.DeleteExpired(context.Background(), time.Now().UTC())
+			if err != nil {
+				slog.Warn("expired widget session cleanup failed", "error", err)
+				return
+			}
+			if deleted > 0 {
+				slog.Info("expired widget sessions deleted", "count", deleted)
+			}
+		}
+		cleanup()
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			cleanup()
+		}
+	}()
 
 	// -------------------------------------------------------------------------
 	// Background: Overdue Invoice Detection
@@ -118,12 +214,20 @@ func main() {
 	go func() {
 		// Run once on startup after a small delay
 		time.Sleep(10 * time.Second)
-		clientSvc.AutoSyncClientWebsites(context.Background(), portalSvc)
+		if queued, err := clientSvc.QueueDueWebsiteSyncs(context.Background(), websiteSyncScheduler, time.Now().UTC()); err != nil {
+			slog.Warn("website auto-sync scheduling failed", "error", err)
+		} else if queued > 0 {
+			slog.Info("website auto-sync jobs queued", "count", queued)
+		}
 
 		ticker := time.NewTicker(1 * time.Hour)
 		defer ticker.Stop()
 		for range ticker.C {
-			clientSvc.AutoSyncClientWebsites(context.Background(), portalSvc)
+			if queued, err := clientSvc.QueueDueWebsiteSyncs(context.Background(), websiteSyncScheduler, time.Now().UTC()); err != nil {
+				slog.Warn("website auto-sync scheduling failed", "error", err)
+			} else if queued > 0 {
+				slog.Info("website auto-sync jobs queued", "count", queued)
+			}
 		}
 	}()
 
@@ -153,20 +257,22 @@ func main() {
 	}()
 
 	// Build HTTP router with all routes and middleware
-	h := router.New(cfg, db, workerPool)
+	h := router.New(cfg, db)
 
 	srv := &http.Server{
-		Addr:         ":" + cfg.Port,
-		Handler:      h,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              ":" + cfg.Port,
+		Handler:           h,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	// Start server in a goroutine so we can handle OS signals below.
 	go func() {
 		slog.Info("ALVEX backend ready",
-			"port",   cfg.Port,
+			"port", cfg.Port,
 			"health", "http://localhost:"+cfg.Port+"/health",
 		)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -187,6 +293,13 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		slog.Warn("forced shutdown", "error", err)
 	}
-	workerPool.Stop()
+	if whatsAppWorker != nil {
+		whatsAppWorker.Stop()
+	}
+	if stripeWorker != nil {
+		stripeWorker.Stop()
+	}
+	documentWorker.Stop()
+	websiteWorker.Stop()
 	slog.Info("server stopped cleanly")
 }

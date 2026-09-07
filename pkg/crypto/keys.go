@@ -2,53 +2,43 @@ package crypto
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
-	"math/big"
-	"os"
 	"strings"
 )
 
 const (
-	apiKeyAlphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
-	apiKeyLength   = 8
+	machineKeyTag  = "alvx_sk_"
+	machineKeySize = 32
 )
 
-// GenerateAPIKey creates a new ALVEX-format API key.
-// Format: ALVX-{4-char-prefix}-{4-digit-number}x{8-random-chars}
-// Example: ALVX-NEXD-8921xab3c4f2d
-func GenerateAPIKey(clientName string) string {
-	prefix := strings.ToUpper(clientName)
-	if len(prefix) > 4 {
-		prefix = prefix[:4]
-	} else {
-		prefix = strings.ToUpper(fmt.Sprintf("%-4s", prefix))
+// GenerateMachineAPIKey creates a high-entropy credential, its safe display
+// prefix, and the one-way digest that should be persisted.
+func GenerateMachineAPIKey() (rawKey, prefix, hash string, err error) {
+	secret := make([]byte, machineKeySize)
+	if _, err = rand.Read(secret); err != nil {
+		return "", "", "", fmt.Errorf("generate API key: %w", err)
 	}
-	prefix = strings.ReplaceAll(prefix, " ", "X")
-
-	numPart := mustRandomInt(1000, 9999)
-	randPart := mustRandomString(apiKeyAlphabet, apiKeyLength)
-
-	return fmt.Sprintf("ALVX-%s-%dx%s", prefix, numPart, randPart)
+	rawKey = machineKeyTag + base64.RawURLEncoding.EncodeToString(secret)
+	prefixLength := len(machineKeyTag) + 8
+	prefix = rawKey[:prefixLength]
+	return rawKey, prefix, HashAPIKey(rawKey), nil
 }
 
-// GenerateWebhookURL constructs the WhatsApp webhook endpoint URL for a client.
-// The base URL is read from WEBHOOK_BASE_URL env var; falls back to the production default.
-func GenerateWebhookURL(clientID string) string {
-	baseURL := os.Getenv("WEBHOOK_BASE_URL")
-	if baseURL == "" {
-		baseURL = "https://api.alvex.ai"
-	}
-	return fmt.Sprintf("%s/webhook/wa/v2/%s", baseURL, clientID)
+// HashAPIKey returns the deterministic one-way digest used for credential
+// lookup. The raw credential must never be logged or persisted.
+func HashAPIKey(rawKey string) string {
+	digest := sha256.Sum256([]byte(rawKey))
+	return hex.EncodeToString(digest[:])
 }
 
-// GeneratePortalToken creates a cryptographically secure 64-character hex token
-// for client portal authentication. This is separate from the API key used for webhooks.
-func GeneratePortalToken() string {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		panic(fmt.Sprintf("crypto/rand failed: %v", err))
-	}
-	return fmt.Sprintf("%x", b)
+// GenerateWebhookURL constructs a WhatsApp callback using the explicit public
+// API URL. Runtime configuration, rather than process-global environment reads,
+// remains the single source of deployment truth.
+func GenerateWebhookURL(publicAPIURL, clientID string) string {
+	return fmt.Sprintf("%s/webhook/wa/v2/%s", strings.TrimRight(publicAPIURL, "/"), clientID)
 }
 
 // SlugifyClientName converts a client name into a URL-safe ID slug.
@@ -69,26 +59,4 @@ func SlugifyClientName(name string) string {
 		s = strings.ReplaceAll(s, "--", "-")
 	}
 	return strings.Trim(s, "-")
-}
-
-// --- Private helpers ---
-
-func mustRandomInt(min, max int64) int64 {
-	n, err := rand.Int(rand.Reader, big.NewInt(max-min+1))
-	if err != nil {
-		panic(fmt.Sprintf("crypto/rand failed: %v", err))
-	}
-	return n.Int64() + min
-}
-
-func mustRandomString(alphabet string, length int) string {
-	result := make([]byte, length)
-	for i := range result {
-		idx, err := rand.Int(rand.Reader, big.NewInt(int64(len(alphabet))))
-		if err != nil {
-			panic(fmt.Sprintf("crypto/rand failed: %v", err))
-		}
-		result[i] = alphabet[idx.Int64()]
-	}
-	return string(result)
 }

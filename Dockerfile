@@ -1,27 +1,39 @@
-# Multi-stage build for optimal image size and security
-FROM golang:1.25-alpine AS builder
+# syntax=docker/dockerfile:1
+
+FROM golang:1.26.8-alpine3.24 AS builder
 
 WORKDIR /app
 
-# Download dependencies
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy source code
 COPY . .
 
-# Compile static Linux binary
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /app/server ./cmd/server
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o /out/alvex-api \
+    ./cmd/server
 
-# Minimal production image
-FROM alpine:latest
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o /out/alvex-migrate \
+    ./cmd/migrate
+
+FROM alpine:3.24
+
 RUN apk --no-cache add ca-certificates tzdata
+RUN addgroup -S -g 10001 alvex \
+    && adduser -S -D -H -u 10001 -G alvex alvex
 
 WORKDIR /app
 
-COPY --from=builder /app/server /app/server
+COPY --from=builder --chown=alvex:alvex /out/alvex-api /app/alvex-api
+COPY --from=builder --chown=alvex:alvex /out/alvex-migrate /app/alvex-migrate
 
-# Expose default port
 EXPOSE 8080
 
-CMD ["/app/server"]
+USER alvex
+
+ENTRYPOINT ["/app/alvex-api"]

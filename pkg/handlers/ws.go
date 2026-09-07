@@ -3,80 +3,97 @@ package handlers
 import (
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/gorilla/websocket"
+
+	"github.com/codexylab/alvex-backend/pkg/response"
+	"github.com/codexylab/alvex-backend/pkg/tenant"
 )
 
-// WSHub manages all active WebSocket connections and broadcasts messages.
+// WSHub manages tenant-partitioned WebSocket connections.
 type WSHub struct {
-	mu      sync.RWMutex
-	clients map[*websocket.Conn]bool
+	mu             sync.RWMutex
+	clients        map[*websocket.Conn]string
+	allowedOrigins map[string]struct{}
+	upgrader       websocket.Upgrader
 }
 
-// NewWSHub creates and returns a new WebSocket hub.
-func NewWSHub() *WSHub {
-	return &WSHub{
-		clients: make(map[*websocket.Conn]bool),
+func NewWSHub(allowedOrigins []string) *WSHub {
+	hub := &WSHub{
+		clients:        make(map[*websocket.Conn]string),
+		allowedOrigins: make(map[string]struct{}, len(allowedOrigins)),
 	}
+	for _, origin := range allowedOrigins {
+		hub.allowedOrigins[strings.TrimRight(origin, "/")] = struct{}{}
+	}
+	hub.upgrader = websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin:     hub.checkOrigin,
+	}
+	return hub
 }
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	// Allow connections from any origin (tighten in production via config)
-	CheckOrigin: func(r *http.Request) bool { return true },
+func (h *WSHub) checkOrigin(r *http.Request) bool {
+	origin := strings.TrimRight(r.Header.Get("Origin"), "/")
+	_, allowed := h.allowedOrigins[origin]
+	return origin != "" && allowed
 }
 
-// ServeWS upgrades an HTTP connection to WebSocket and registers the client.
-//
-// WS /ws/activity
+// ServeWS registers a connection under the verified organization scope.
 func (h *WSHub) ServeWS(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
+	scope, ok := tenant.FromContext(r.Context())
+	if !ok {
+		response.Forbidden(w)
+		return
+	}
+	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		slog.Error("websocket upgrade failed", "error", err)
+		slog.Warn("websocket upgrade rejected", "error", err)
 		return
 	}
 
 	h.mu.Lock()
-	h.clients[conn] = true
+	h.clients[conn] = scope.OrganizationID
 	h.mu.Unlock()
+	slog.Info("websocket client connected", "organization_id", scope.OrganizationID, "remote", conn.RemoteAddr())
 
-	slog.Info("websocket client connected", "remote", conn.RemoteAddr())
-
-	// Block here — read loop keeps the connection alive and detects disconnects
 	defer func() {
 		h.mu.Lock()
 		delete(h.clients, conn)
 		h.mu.Unlock()
-		conn.Close()
-		slog.Info("websocket client disconnected", "remote", conn.RemoteAddr())
+		_ = conn.Close()
+		slog.Info("websocket client disconnected", "organization_id", scope.OrganizationID, "remote", conn.RemoteAddr())
 	}()
-
 	for {
-		_, _, err := conn.ReadMessage()
-		if err != nil {
-			break // Client disconnected or sent invalid frame
+		if _, _, err := conn.ReadMessage(); err != nil {
+			break
 		}
 	}
 }
 
-// Broadcast sends a JSON message to every connected WebSocket client.
-// Failed connections are removed from the hub to prevent double-close on next broadcast.
-func (h *WSHub) Broadcast(message []byte) {
+// BroadcastToOrganization sends an event only to connections in one tenant.
+func (h *WSHub) BroadcastToOrganization(organizationID string, message []byte) {
+	if organizationID == "" {
+		slog.Warn("websocket event dropped because organization scope is missing")
+		return
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-
-	for conn := range h.clients {
+	for conn, connectedOrganizationID := range h.clients {
+		if connectedOrganizationID != organizationID {
+			continue
+		}
 		if err := conn.WriteMessage(websocket.TextMessage, message); err != nil {
 			slog.Warn("websocket write failed, removing connection", "error", err)
-			conn.Close()
+			_ = conn.Close()
 			delete(h.clients, conn)
 		}
 	}
 }
 
-// ConnectedCount returns the number of active WebSocket connections.
 func (h *WSHub) ConnectedCount() int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()

@@ -45,9 +45,9 @@ func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 // RequestID injects a short unique request ID into the context and response header.
 func RequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b := make([]byte, 4)
+		b := make([]byte, 16)
 		_, _ = rand.Read(b)
-		id := fmt.Sprintf("%08x", b)
+		id := fmt.Sprintf("%032x", b)
 		w.Header().Set("X-Request-Id", id)
 		ctx := context.WithValue(r.Context(), requestIDKey, id)
 		next.ServeHTTP(w, r.WithContext(ctx))
@@ -66,19 +66,19 @@ func GetRequestID(r *http.Request) string {
 // JSON output including method, path, status, latency, bytes, IP, and request ID.
 func Logger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start   := time.Now()
+		start := time.Now()
 		wrapped := &responseWriter{ResponseWriter: w, status: http.StatusOK}
 
 		next.ServeHTTP(wrapped, r)
 
 		slog.Info("request",
-			"id",       GetRequestID(r),
-			"method",   r.Method,
-			"path",     r.URL.Path,
-			"status",   wrapped.status,
-			"latency",  time.Since(start).String(),
-			"bytes",    wrapped.bytes,
-			"ip",       r.RemoteAddr,
+			"id", GetRequestID(r),
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", wrapped.status,
+			"latency", time.Since(start).String(),
+			"bytes", wrapped.bytes,
+			"ip", r.RemoteAddr,
 		)
 	})
 }

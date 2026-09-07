@@ -1,3 +1,5 @@
+//go:build ignore
+
 package main
 
 import (
@@ -5,8 +7,8 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/codexylab/alvex-backend/pkg/services/ai"
 	"github.com/codexylab/alvex-backend/pkg/crypto"
+	"github.com/codexylab/alvex-backend/pkg/services/ai"
 	_ "modernc.org/sqlite"
 )
 
@@ -65,6 +67,6 @@ func main() {
 	if err != nil {
 		fmt.Printf("ERROR calling AI API: %v\n", err)
 	} else {
-		fmt.Printf("SUCCESS response: %s\n", resp)
+		fmt.Printf("SUCCESS response: %s\n", resp.Text)
 	}
 }

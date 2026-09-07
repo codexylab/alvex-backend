@@ -1,25 +1,24 @@
-﻿package handlers
+package handlers
 
 import (
 	"net/http"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/codexylab/alvex-backend/pkg/middleware"
-	"github.com/codexylab/alvex-backend/pkg/services"
 	"github.com/codexylab/alvex-backend/pkg/response"
+	"github.com/codexylab/alvex-backend/pkg/services"
 )
 
 // ScrapeHandler handles website scraping requests.
 type ScrapeHandler struct {
-	ClientSvc *services.ClientService
-	PortalSvc *services.PortalService
+	ClientSvc   *services.ClientService
+	WebsiteSync *services.WebsiteIndexScheduler
 }
 
 type scrapeResponse struct {
-	SyncedAt      string `json:"synced_at"`
-	ContentLength int    `json:"content_length"`
+	JobID  string `json:"job_id"`
+	Status string `json:"status"`
 }
 
 // ScrapeAdmin handles manual scraping triggered by the Admin settings page.
@@ -39,16 +38,16 @@ func (h *ScrapeHandler) ScrapeAdmin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	scrapedText, syncedAt, err := h.ClientSvc.ScrapeAndSave(r.Context(), id, client.Domain, h.PortalSvc)
+	jobID, err := h.WebsiteSync.EnqueueManual(r.Context(), id, client.Domain)
 	if err != nil {
-		response.BadRequest(w, "Failed to scrape website: "+err.Error())
+		response.ServiceUnavailable(w, "Failed to queue website synchronization")
 		return
 	}
 
-	response.Success(w, scrapeResponse{
-		SyncedAt:      syncedAt.Format(time.RFC3339),
-		ContentLength: len(scrapedText),
-	})
+	response.JSON(w, http.StatusAccepted, response.APIResponse{Success: true, Data: scrapeResponse{
+		JobID:  jobID,
+		Status: "queued",
+	}})
 }
 
 // ScrapePortal handles client-triggered manual scraping from the Client Portal.
@@ -72,14 +71,14 @@ func (h *ScrapeHandler) ScrapePortal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	scrapedText, syncedAt, err := h.ClientSvc.ScrapeAndSave(r.Context(), clientID, client.Domain, h.PortalSvc)
+	jobID, err := h.WebsiteSync.EnqueueManual(r.Context(), clientID, client.Domain)
 	if err != nil {
-		response.BadRequest(w, "Failed to scrape website: "+err.Error())
+		response.ServiceUnavailable(w, "Failed to queue website synchronization")
 		return
 	}
 
-	response.Success(w, scrapeResponse{
-		SyncedAt:      syncedAt.Format(time.RFC3339),
-		ContentLength: len(scrapedText),
-	})
+	response.JSON(w, http.StatusAccepted, response.APIResponse{Success: true, Data: scrapeResponse{
+		JobID:  jobID,
+		Status: "queued",
+	}})
 }

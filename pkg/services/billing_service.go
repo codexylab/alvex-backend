@@ -1,4 +1,4 @@
-﻿package services
+package services
 
 import (
 	"context"
@@ -6,17 +6,17 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/codexylab/alvex-backend/pkg/apierr"
 	"github.com/codexylab/alvex-backend/pkg/models"
 	"github.com/codexylab/alvex-backend/pkg/repository"
-	"github.com/codexylab/alvex-backend/pkg/apierr"
 )
 
 // BillingStats represents aggregated metrics.
 type BillingStats struct {
-	TotalMRR        float64            `json:"total_mrr"`
-	ActiveClients   int                `json:"active_clients"`
-	PendingBalance  float64            `json:"pending_balance"`
-	PlanBreakdown   map[string]int     `json:"plan_breakdown"`
+	TotalMRR       float64        `json:"total_mrr"`
+	ActiveClients  int            `json:"active_clients"`
+	PendingBalance float64        `json:"pending_balance"`
+	PlanBreakdown  map[string]int `json:"plan_breakdown"`
 }
 
 // BillingService coordinates billing-related operations.
@@ -36,17 +36,14 @@ func (s *BillingService) GetStats(ctx context.Context) (*BillingStats, error) {
 		return nil, err
 	}
 
-	planCosts := map[string]float64{
-		"Basic": 29.00, "Pro": 99.00, "Enterprise": 499.00,
-	}
-
 	stats := &BillingStats{
 		PlanBreakdown: map[string]int{},
 	}
 
 	for plan, count := range planBreakdown {
 		stats.PlanBreakdown[plan] = count
-		stats.TotalMRR += planCosts[plan] * float64(count)
+		price, _ := models.BillingPlanPrice(models.BillingPlan(plan))
+		stats.TotalMRR += price * float64(count)
 		stats.ActiveClients += count
 	}
 
@@ -57,6 +54,10 @@ func (s *BillingService) GetStats(ctx context.Context) (*BillingStats, error) {
 	stats.PendingBalance = pendingBalance
 
 	return stats, nil
+}
+
+func (s *BillingService) GetPlanCatalog() map[models.BillingPlan]float64 {
+	return models.BillingPlanCatalog()
 }
 
 // ListInvoices lists billing invoices records.

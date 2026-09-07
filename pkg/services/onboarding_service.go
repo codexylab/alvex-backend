@@ -1,10 +1,10 @@
-﻿package services
+package services
 
 import (
 	"context"
 	"fmt"
-	"log/slog"
-	"time"
+	"html"
+	"strings"
 
 	"github.com/codexylab/alvex-backend/pkg/models"
 )
@@ -30,17 +30,24 @@ type OnboardingResult struct {
 
 // OnboardingService orchestrates end-to-end automated client onboarding.
 type OnboardingService struct {
-	ClientSvc *ClientService
-	PortalSvc *PortalService
-	RAGSvc    *RAGService
+	ClientSvc       *ClientService
+	WebsiteSync     *WebsiteIndexScheduler
+	WidgetScriptURL string
+	PublicAPIURL    string
 }
 
 // NewOnboardingService creates a new OnboardingService instance.
-func NewOnboardingService(clientSvc *ClientService, portalSvc *PortalService, ragSvc *RAGService) *OnboardingService {
+func NewOnboardingService(
+	clientSvc *ClientService,
+	websiteSync *WebsiteIndexScheduler,
+	frontendURL string,
+	publicAPIURL string,
+) *OnboardingService {
 	return &OnboardingService{
-		ClientSvc: clientSvc,
-		PortalSvc: portalSvc,
-		RAGSvc:    ragSvc,
+		ClientSvc:       clientSvc,
+		WebsiteSync:     websiteSync,
+		WidgetScriptURL: strings.TrimRight(frontendURL, "/") + "/widget.js",
+		PublicAPIURL:    strings.TrimRight(publicAPIURL, "/"),
 	}
 }
 
@@ -70,36 +77,31 @@ func (s *OnboardingService) StartOnboarding(ctx context.Context, req OnboardingR
 	}
 
 	// Build widget embed snippet
-	snippet := fmt.Sprintf(`<script src="https://cdn.jsdelivr.net/gh/codexylab/alvex-widget@main/widget.js" data-client-id="%s" async></script>`, client.ID)
-	portalURL := fmt.Sprintf("/portal?token=%s", client.PortalToken)
+	snippet := fmt.Sprintf(
+		`<script src="%s" data-id="asst_%s" data-api-url="%s" async></script>`,
+		html.EscapeString(s.WidgetScriptURL),
+		html.EscapeString(client.ID),
+		html.EscapeString(s.PublicAPIURL),
+	)
+	portalURL := "/portal"
 
-	// Trigger async website scrape + RAG indexing if domain provided
+	status := "complete"
 	if req.Domain != "" {
-		go func(cid, dom string) {
-			bgCtx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-			defer cancel()
-
-			slog.Info("onboarding: scraping website", "client_id", cid, "domain", dom)
-			scrapedText, _, err := s.ClientSvc.ScrapeAndSave(bgCtx, cid, dom, s.PortalSvc)
-			if err != nil {
-				slog.Warn("onboarding: website scrape failed", "client_id", cid, "error", err)
-			} else if s.RAGSvc != nil && scrapedText != "" {
-				slog.Info("onboarding: indexing RAG vectors", "client_id", cid)
-				_ = s.RAGSvc.IndexContent(bgCtx, cid, dom, scrapedText)
-			}
-
-			// Mark onboarding complete
-			_, _ = s.ClientSvc.Repo.UpdateFields(bgCtx, cid, map[string]interface{}{
-				"onboarding_status": "complete",
-				"updated_at":        time.Now(),
-			})
-		}(client.ID, req.Domain)
+		status = "processing"
+		if err := s.ClientSvc.UpdateOnboardingStatus(ctx, client.ID, status); err != nil {
+			return nil, fmt.Errorf("mark onboarding processing: %w", err)
+		}
+		key := WebsiteSyncOnboarding + ":" + client.ID
+		if _, err := s.WebsiteSync.Enqueue(ctx, client.ID, req.Domain, WebsiteSyncOnboarding, key); err != nil {
+			_ = s.ClientSvc.UpdateOnboardingStatus(ctx, client.ID, "failed")
+			return nil, fmt.Errorf("queue onboarding website sync: %w", err)
+		}
 	}
 
 	return &OnboardingResult{
 		Client:        client,
 		WidgetSnippet: snippet,
 		PortalURL:     portalURL,
-		Status:        "processing",
+		Status:        status,
 	}, nil
 }

@@ -13,7 +13,7 @@ import (
 
 // PortalStatsData represents stats query fields.
 type PortalStatsData struct {
-	TotalConversations int
+	TotalConversations  int
 	FailedConversations int
 	AvgLatency          float64
 	ThisMonthConvs      int
@@ -50,7 +50,7 @@ func NewSQLPortalRepository(db *database.DB) *SQLPortalRepository {
 // GetClientProfile retrieves the profile details.
 func (r *SQLPortalRepository) GetClientProfile(ctx context.Context, id string) (*models.Client, error) {
 	row := r.DB.QueryRowContext(ctx, r.DB.Adapt(`SELECT `+clientSelectCols+`,
-		portal_token, owner_id,
+		owner_id,
 		COALESCE(guardrails_enabled,false), COALESCE(guardrails_reply,''),
 		COALESCE(chat_retention_days,30),
 		created_at, updated_at

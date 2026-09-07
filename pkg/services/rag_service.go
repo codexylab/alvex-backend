@@ -1,4 +1,4 @@
-﻿package services
+package services
 
 import (
 	"context"
@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/codexylab/alvex-backend/pkg/models"
 	"github.com/codexylab/alvex-backend/pkg/repository"
@@ -15,11 +17,15 @@ import (
 // and vector retrieval for client chatbots.
 type RAGService struct {
 	ChunkRepo    repository.ChunkRepository
-	EmbeddingSvc *EmbeddingService
+	EmbeddingSvc EmbeddingGenerator
+}
+
+type EmbeddingGenerator interface {
+	GenerateEmbedding(ctx context.Context, text string) ([]float32, error)
 }
 
 // NewRAGService creates a new RAGService.
-func NewRAGService(chunkRepo repository.ChunkRepository, embeddingSvc *EmbeddingService) *RAGService {
+func NewRAGService(chunkRepo repository.ChunkRepository, embeddingSvc EmbeddingGenerator) *RAGService {
 	return &RAGService{
 		ChunkRepo:    chunkRepo,
 		EmbeddingSvc: embeddingSvc,
@@ -29,16 +35,35 @@ func NewRAGService(chunkRepo repository.ChunkRepository, embeddingSvc *Embedding
 // IndexContent splits raw content into chunks, generates vector embeddings,
 // and saves them to the repository for semantic retrieval.
 func (r *RAGService) IndexContent(ctx context.Context, clientID, sourceURL, content string) error {
+	return r.indexSource(ctx, clientID, "", sourceURL, content)
+}
+
+// IndexDocument indexes one uploaded document without deleting chunks that
+// belong to other documents or to the client's website.
+func (r *RAGService) IndexDocument(
+	ctx context.Context,
+	clientID string,
+	documentID string,
+	filename string,
+	content string,
+) error {
+	if documentID == "" {
+		return fmt.Errorf("document ID is required")
+	}
+	return r.indexSource(ctx, clientID, documentID, filename, content)
+}
+
+func (r *RAGService) indexSource(
+	ctx context.Context,
+	clientID string,
+	documentID string,
+	sourceURL string,
+	content string,
+) error {
 	if strings.TrimSpace(content) == "" {
 		return nil
 	}
 
-	// 1. Delete previous chunks for this client & source to prevent duplicates
-	if err := r.ChunkRepo.DeleteClientChunks(ctx, clientID); err != nil {
-		slog.Warn("failed to delete previous chunks", "client_id", clientID, "error", err)
-	}
-
-	// 2. Chunk text (150 words per chunk, 25 words overlap)
 	chunks := ChunkText(content, 150, 25)
 	if len(chunks) == 0 {
 		return nil
@@ -46,33 +71,32 @@ func (r *RAGService) IndexContent(ctx context.Context, clientID, sourceURL, cont
 
 	slog.Info("indexing chunks for client", "client_id", clientID, "chunks_count", len(chunks))
 
-	// 3. Generate embeddings and save each chunk
+	indexedChunks := make([]models.DocumentChunk, 0, len(chunks))
 	for i, chunkText := range chunks {
 		var emb []float32
 		if r.EmbeddingSvc != nil {
-			var err error
-			emb, err = r.EmbeddingSvc.GenerateEmbedding(ctx, chunkText)
+			generated, err := r.EmbeddingSvc.GenerateEmbedding(ctx, chunkText)
 			if err != nil {
-				slog.Warn("embedding generation failed for chunk", "index", i, "error", err)
+				return fmt.Errorf("generate embedding for chunk %d: %w", i, err)
 			}
+			emb = generated
 		}
 
-		chunkID := fmt.Sprintf("chk_%s_%d_%d", clientID, time.Now().Unix(), i)
-		chunkModel := &models.DocumentChunk{
-			ID:         chunkID,
+		indexedChunks = append(indexedChunks, models.DocumentChunk{
+			ID:         uuid.NewString(),
+			DocumentID: documentID,
 			ClientID:   clientID,
 			Content:    chunkText,
 			Embedding:  emb,
 			SourceURL:  sourceURL,
 			ChunkIndex: i,
-			CreatedAt:  time.Now(),
-		}
-
-		if err := r.ChunkRepo.InsertChunk(ctx, chunkModel); err != nil {
-			slog.Error("failed to insert chunk", "chunk_id", chunkID, "error", err)
-		}
+			CreatedAt:  time.Now().UTC(),
+		})
 	}
 
+	if err := r.ChunkRepo.ReplaceSourceChunks(ctx, clientID, documentID, sourceURL, indexedChunks); err != nil {
+		return fmt.Errorf("replace indexed chunks: %w", err)
+	}
 	return nil
 }
 
@@ -102,12 +126,21 @@ func (r *RAGService) RetrieveRelevant(ctx context.Context, clientID, query strin
 	}
 
 	var sb strings.Builder
-	for i, c := range chunks {
-		if i > 0 {
+	written := 0
+	for _, c := range chunks {
+		if len(queryEmb) > 0 {
+			if len(c.Embedding) == 0 || CosineSimilarity(queryEmb, c.Embedding) < minimumKnowledgeSimilarity {
+				continue
+			}
+		}
+		if written > 0 {
 			sb.WriteString("\n---\n")
 		}
 		sb.WriteString(c.Content)
+		written++
 	}
 
 	return sb.String(), nil
 }
+
+const minimumKnowledgeSimilarity float32 = 0.15

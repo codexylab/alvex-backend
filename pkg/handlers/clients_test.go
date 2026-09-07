@@ -1,4 +1,4 @@
-﻿package handlers
+package handlers
 
 import (
 	"context"
@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-chi/chi/v5"
 	_ "modernc.org/sqlite"
 
 	"github.com/codexylab/alvex-backend/pkg/database"
@@ -16,6 +17,7 @@ import (
 	"github.com/codexylab/alvex-backend/pkg/models"
 	"github.com/codexylab/alvex-backend/pkg/repository"
 	"github.com/codexylab/alvex-backend/pkg/services"
+	"github.com/codexylab/alvex-backend/pkg/tenant"
 )
 
 func setupTestDB(t *testing.T) *sql.DB {
@@ -36,12 +38,16 @@ func setupTestDB(t *testing.T) *sql.DB {
 	);
 	CREATE TABLE clients (
 		id                   TEXT PRIMARY KEY,
+		organization_id      TEXT NOT NULL DEFAULT 'org_test',
 		name                 TEXT NOT NULL,
 		domain               TEXT,
+		allowed_origins      TEXT NOT NULL DEFAULT '[]',
+		whatsapp_phone_number_id TEXT,
 		status               TEXT NOT NULL DEFAULT 'Active',
 		provider             TEXT NOT NULL DEFAULT 'Gemini',
 		model                TEXT NOT NULL DEFAULT 'Gemini 2.0 Flash',
 		api_key              TEXT,
+		openai_api_key       TEXT,
 		gemini_api_key       TEXT,
 		groq_api_key         TEXT,
 		groq_fallback_enabled INTEGER NOT NULL DEFAULT 0,
@@ -76,6 +82,13 @@ func setupTestDB(t *testing.T) *sql.DB {
 		created_at           DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		updated_at           DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
+	CREATE TABLE client_memberships (
+		client_id  TEXT NOT NULL,
+		user_id    TEXT NOT NULL,
+		role       TEXT NOT NULL,
+		status     TEXT NOT NULL,
+		PRIMARY KEY (client_id, user_id)
+	);
 	`
 	_, err = db.Exec(schema)
 	if err != nil {
@@ -96,8 +109,8 @@ func TestClientHandler_Create(t *testing.T) {
 	defer db.Close()
 
 	wrapDB := database.NewDB(db, "sqlite")
-	repo := repository.NewSQLClientRepository(wrapDB)
-	svc := services.NewClientService(repo, "")
+	repo := repository.NewTenantSQLClientRepository(wrapDB)
+	svc := services.NewClientService(repo, "", "http://localhost:8080")
 	h := &ClientHandler{Service: svc}
 
 	// Prepare request
@@ -107,6 +120,7 @@ func TestClientHandler_Create(t *testing.T) {
 
 	// Inject test user into context (simulating auth middleware)
 	ctx := context.WithValue(req.Context(), middleware.UserIDKey, "dev-user-001")
+	ctx = tenant.WithScope(ctx, tenant.Scope{OrganizationID: "org_test", UserID: "dev-user-001", Role: "owner"})
 	req = req.WithContext(ctx)
 
 	rec := httptest.NewRecorder()
@@ -148,11 +162,12 @@ func TestClientHandler_List(t *testing.T) {
 	}
 
 	wrapDB := database.NewDB(db, "sqlite")
-	repo := repository.NewSQLClientRepository(wrapDB)
-	svc := services.NewClientService(repo, "")
+	repo := repository.NewTenantSQLClientRepository(wrapDB)
+	svc := services.NewClientService(repo, "", "http://localhost:8080")
 	h := &ClientHandler{Service: svc}
 
 	req := httptest.NewRequest("GET", "/api/v1/clients?search=nexus", nil)
+	req = req.WithContext(tenant.WithScope(req.Context(), tenant.Scope{OrganizationID: "org_test"}))
 	rec := httptest.NewRecorder()
 
 	h.List(rec, req)
@@ -174,5 +189,169 @@ func TestClientHandler_List(t *testing.T) {
 
 	if len(res.Data.Data) != 1 {
 		t.Errorf("expected 1 client in response, got %d", len(res.Data.Data))
+	}
+}
+
+func TestClientHandler_SetStatusUsesDesiredState(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	_, err := db.Exec(`
+		INSERT INTO clients (
+			id, name, domain, status, api_key, system_persona, webhook_url, owner_id
+		)
+		VALUES (
+			'status-client', 'Status Client', 'https://status.example.com', 'Active',
+			'test-key', 'Test persona', 'https://api.example.com/webhook', 'dev-user-001'
+		)
+	`)
+	if err != nil {
+		t.Fatalf("failed to seed client: %v", err)
+	}
+
+	wrapDB := database.NewDB(db, "sqlite")
+	repo := repository.NewTenantSQLClientRepository(wrapDB)
+	handler := &ClientHandler{Service: services.NewClientService(repo, "", "http://localhost:8080")}
+	router := chi.NewRouter()
+	router.Patch("/clients/{id}/status", handler.ToggleStatus)
+
+	for _, desiredStatus := range []string{"Active", "Suspended", "Suspended"} {
+		request := httptest.NewRequest(
+			http.MethodPatch,
+			"/clients/status-client/status",
+			strings.NewReader(`{"status":"`+desiredStatus+`"}`),
+		)
+		request = request.WithContext(tenant.WithScope(request.Context(), tenant.Scope{
+			OrganizationID: "org_test",
+		}))
+		responseRecorder := httptest.NewRecorder()
+
+		router.ServeHTTP(responseRecorder, request)
+		if responseRecorder.Code != http.StatusOK {
+			t.Fatalf("set %s: expected 200, got %d: %s", desiredStatus, responseRecorder.Code, responseRecorder.Body.String())
+		}
+
+		var actualStatus string
+		if err := db.QueryRow(`SELECT status FROM clients WHERE id = 'status-client'`).Scan(&actualStatus); err != nil {
+			t.Fatalf("read status: %v", err)
+		}
+		if actualStatus != desiredStatus {
+			t.Fatalf("expected %s, got %s", desiredStatus, actualStatus)
+		}
+	}
+}
+
+func TestClientHandler_SetAllStatusesIsTenantScoped(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	_, err := db.Exec(`
+		INSERT INTO clients (id, organization_id, name, status, owner_id) VALUES
+			('tenant-client-a', 'org_test', 'Tenant A', 'Active', 'dev-user-001'),
+			('tenant-client-b', 'org_test', 'Tenant B', 'Suspended', 'dev-user-001'),
+			('other-client', 'org_other', 'Other Tenant', 'Active', 'dev-user-001')
+	`)
+	if err != nil {
+		t.Fatalf("failed to seed clients: %v", err)
+	}
+
+	wrapDB := database.NewDB(db, "sqlite")
+	repo := repository.NewTenantSQLClientRepository(wrapDB)
+	handler := &ClientHandler{Service: services.NewClientService(repo, "", "http://localhost:8080")}
+	request := httptest.NewRequest(http.MethodPatch, "/clients/status", strings.NewReader(`{"status":"Suspended"}`))
+	request = request.WithContext(tenant.WithScope(request.Context(), tenant.Scope{OrganizationID: "org_test"}))
+	responseRecorder := httptest.NewRecorder()
+
+	handler.SetAllStatuses(responseRecorder, request)
+	if responseRecorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", responseRecorder.Code, responseRecorder.Body.String())
+	}
+
+	rows, err := db.Query(`SELECT id, status FROM clients ORDER BY id`)
+	if err != nil {
+		t.Fatalf("query clients: %v", err)
+	}
+	defer rows.Close()
+
+	statuses := map[string]string{}
+	for rows.Next() {
+		var id, status string
+		if err := rows.Scan(&id, &status); err != nil {
+			t.Fatalf("scan status: %v", err)
+		}
+		statuses[id] = status
+	}
+	if statuses["tenant-client-a"] != "Suspended" || statuses["tenant-client-b"] != "Suspended" {
+		t.Fatalf("tenant clients were not suspended: %#v", statuses)
+	}
+	if statuses["other-client"] != "Active" {
+		t.Fatalf("other tenant was modified: %#v", statuses)
+	}
+}
+
+func TestClientHandler_GetOneRedactsStoredSecrets(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	_, err := db.Exec(`
+		INSERT INTO clients (
+			id, name, domain, openai_api_key, gemini_api_key, groq_api_key,
+			system_persona, webhook_url, owner_id
+		)
+		VALUES (
+			'secret-client', 'Secret Client', 'https://secret.example.com',
+			'openai-secret', 'gemini-secret', 'groq-secret',
+			'Test persona', 'https://api.example.com/webhook', 'dev-user-001'
+		)
+	`)
+	if err != nil {
+		t.Fatalf("failed to seed client: %v", err)
+	}
+
+	wrapDB := database.NewDB(db, "sqlite")
+	repo := repository.NewTenantSQLClientRepository(wrapDB)
+	handler := &ClientHandler{Service: services.NewClientService(
+		repo,
+		"12345678901234567890123456789012",
+		"http://localhost:8080",
+	)}
+	router := chi.NewRouter()
+	router.Get("/clients/{id}", handler.GetOne)
+	request := httptest.NewRequest(http.MethodGet, "/clients/secret-client", nil)
+	request = request.WithContext(tenant.WithScope(request.Context(), tenant.Scope{OrganizationID: "org_test"}))
+	responseRecorder := httptest.NewRecorder()
+
+	router.ServeHTTP(responseRecorder, request)
+	if responseRecorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", responseRecorder.Code, responseRecorder.Body.String())
+	}
+	var envelope struct {
+		Data models.Client `json:"data"`
+	}
+	if err := json.Unmarshal(responseRecorder.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if envelope.Data.OpenAIAPIKey != "" || envelope.Data.GeminiAPIKey != "" || envelope.Data.GroqAPIKey != "" {
+		t.Fatalf("response exposed secrets: %#v", envelope.Data)
+	}
+	var legacyClientKey sql.NullString
+	var rotatedOpenAIKey, rotatedGeminiKey, rotatedGroqKey string
+	if err := db.QueryRow(`
+		SELECT api_key, openai_api_key, gemini_api_key, groq_api_key
+		FROM clients WHERE id = 'secret-client'
+	`).Scan(&legacyClientKey, &rotatedOpenAIKey, &rotatedGeminiKey, &rotatedGroqKey); err != nil {
+		t.Fatalf("load rotated secrets: %v", err)
+	}
+	if legacyClientKey.Valid {
+		t.Fatal("retired legacy client API key must remain unset")
+	}
+	for name, value := range map[string]string{
+		"openai": rotatedOpenAIKey,
+		"gemini": rotatedGeminiKey,
+		"groq":   rotatedGroqKey,
+	} {
+		if !strings.HasPrefix(value, "v1:") {
+			t.Errorf("%s secret was not upgraded to versioned encryption", name)
+		}
 	}
 }

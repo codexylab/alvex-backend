@@ -1,0 +1,2 @@
+-- Forward-only security migration. Retired shared bearer tokens cannot be
+-- reconstructed after deletion.

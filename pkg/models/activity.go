@@ -8,8 +8,8 @@ import (
 type ActivityChannel string
 
 const (
-	ChannelWeb       ActivityChannel = "web"
-	ChannelWhatsApp  ActivityChannel = "whatsapp"
+	ChannelWeb      ActivityChannel = "web"
+	ChannelWhatsApp ActivityChannel = "whatsapp"
 )
 
 // ActivityStatus represents the resolution state of a conversation entry.

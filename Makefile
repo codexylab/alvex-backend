@@ -2,7 +2,7 @@
 # ALVEX Backend — Makefile
 # ============================================================
 
-.PHONY: run build seed migrate-up migrate-down test lint clean
+.PHONY: run build seed migrate-up test test-short fmt fmt-check lint vet verify clean tidy
 
 # --- Development ---
 run:
@@ -10,21 +10,15 @@ run:
 
 # --- Build ---
 build:
-	go build -ldflags="-s -w" -o bin/alvex.exe ./cmd/server/
+	go build -trimpath -ldflags="-s -w" -o bin/alvex ./cmd/server/
+	go build -trimpath -ldflags="-s -w" -o bin/alvex-migrate ./cmd/migrate/
 
 # --- Database ---
 seed:
 	go run ./cmd/seed/
 
 migrate-up:
-	go run -mod=mod github.com/golang-migrate/migrate/v4/cmd/migrate@latest \
-		-path internal/database/migrations \
-		-database "$(DATABASE_URL)" up
-
-migrate-down:
-	go run -mod=mod github.com/golang-migrate/migrate/v4/cmd/migrate@latest \
-		-path internal/database/migrations \
-		-database "$(DATABASE_URL)" down 1
+	go run ./cmd/migrate/
 
 # --- Testing ---
 test:
@@ -33,12 +27,23 @@ test:
 test-short:
 	go test ./... -short
 
+fmt:
+	gofmt -w api cmd pkg scratch
+
+fmt-check:
+	@test -z "$$(gofmt -l api cmd pkg scratch)" || \
+		(echo "Go files require formatting:"; gofmt -l api cmd pkg scratch; exit 1)
+
 # --- Code quality ---
 lint:
 	golangci-lint run ./...
 
 vet:
 	go vet ./...
+
+verify: fmt-check vet test
+	go build ./cmd/server
+	go build ./cmd/migrate
 
 # --- Cleanup ---
 clean:

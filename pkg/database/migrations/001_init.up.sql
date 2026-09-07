@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS clients (
     provider         VARCHAR(50)  NOT NULL DEFAULT 'Gemini',
     model            VARCHAR(100) NOT NULL DEFAULT 'Gemini Pro',
     api_key          TEXT,
+    openai_api_key   TEXT,
     gemini_api_key   TEXT,
     groq_api_key     TEXT,
     groq_fallback_enabled BOOLEAN NOT NULL DEFAULT FALSE,

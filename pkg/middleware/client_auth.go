@@ -1,77 +1,69 @@
-﻿package middleware
+package middleware
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 
-	"github.com/codexylab/alvex-backend/pkg/database"
+	"github.com/codexylab/alvex-backend/pkg/repository"
 	"github.com/codexylab/alvex-backend/pkg/response"
 )
 
 type portalCtxKey string
 
-const portalClientIDKey portalCtxKey = "portal_client_id"
+const (
+	portalClientIDKey portalCtxKey = "portal_client_id"
+	portalRoleKey     portalCtxKey = "portal_role"
 
-// AuthenticateClientPortal is middleware that validates the client portal
-// access token (portal_token) from the Authorization header or ?token= query param.
-// On success it injects the client ID into the request context.
-func AuthenticateClientPortal(db *database.DB) func(http.Handler) http.Handler {
+	// ClientHeader selects one client when a user has multiple assignments.
+	ClientHeader = "X-Client-ID"
+)
+
+// RequireClientMembership maps a verified Supabase user to one active client.
+// Long-lived shared portal tokens and query-string credentials are not accepted.
+func RequireClientMembership(repo repository.ClientMembershipRepository) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Extract token from Bearer header or query param
-			token := ""
-			if authHeader := r.Header.Get("Authorization"); authHeader != "" {
-				parts := strings.SplitN(authHeader, " ", 2)
-				if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
-					token = parts[1]
-				}
-			} else {
-				token = r.URL.Query().Get("token")
-			}
-
-			if token == "" {
+			identity, ok := GetAuthenticatedUser(r)
+			if !ok || identity.ApplicationUserID == "" {
 				response.Unauthorized(w)
 				return
 			}
 
-			// Validate token against DB â€” must match an Active client
-			var clientID string
-			var err error
-			if strings.HasPrefix(token, "dev-token-alvex-") {
-				clientID = strings.TrimPrefix(token, "dev-token-alvex-")
-				var status string
-				err = db.QueryRowContext(r.Context(), db.Adapt(`
-					SELECT status FROM clients WHERE id = $1`),
-					clientID,
-				).Scan(&status)
-				if err != nil || status != "Active" {
-					response.Unauthorized(w)
-					return
-				}
-			} else {
-				err = db.QueryRowContext(r.Context(), db.Adapt(`
-					SELECT id FROM clients
-					WHERE portal_token = $1 AND status = 'Active'`),
-					token,
-				).Scan(&clientID)
-			}
-
-			if err != nil {
-				response.Unauthorized(w)
+			requestedClientID := strings.TrimSpace(r.Header.Get(ClientHeader))
+			access, err := repo.ResolveActiveAccess(r.Context(), identity.ApplicationUserID, requestedClientID)
+			switch {
+			case errors.Is(err, repository.ErrClientSelectionRequired):
+				response.BadRequest(w, "Select a client using X-Client-ID")
+				return
+			case errors.Is(err, repository.ErrClientMembershipNotFound):
+				response.Forbidden(w)
+				return
+			case err != nil:
+				response.InternalError(w)
 				return
 			}
 
-			ctx := context.WithValue(r.Context(), portalClientIDKey, clientID)
+			ctx := context.WithValue(r.Context(), portalClientIDKey, access.ClientID)
+			ctx = context.WithValue(ctx, portalRoleKey, access.Role)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }
 
-// GetPortalClientID retrieves the authenticated client's ID from the request context.
+// GetPortalClientID retrieves the authorized client ID from request context.
 func GetPortalClientID(r *http.Request) string {
 	if id, ok := r.Context().Value(portalClientIDKey).(string); ok {
 		return id
+	}
+	return ""
+}
+
+// GetPortalRole retrieves the user's client-scoped role.
+func GetPortalRole(r *http.Request) string {
+	if role, ok := r.Context().Value(portalRoleKey).(string); ok {
+		return role
 	}
 	return ""
 }

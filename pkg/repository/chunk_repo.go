@@ -1,7 +1,8 @@
-﻿package repository
+package repository
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"math"
 	"sort"
@@ -14,6 +15,7 @@ import (
 // ChunkRepository manages storage and semantic retrieval of document chunks.
 type ChunkRepository interface {
 	InsertChunk(ctx context.Context, chunk *models.DocumentChunk) error
+	ReplaceSourceChunks(ctx context.Context, clientID, documentID, sourceURL string, chunks []models.DocumentChunk) error
 	GetChunksByClient(ctx context.Context, clientID string) ([]models.DocumentChunk, error)
 	DeleteClientChunks(ctx context.Context, clientID string) error
 	SearchSimilar(ctx context.Context, clientID string, queryEmbedding []float32, limit int) ([]models.DocumentChunk, error)
@@ -41,14 +43,19 @@ func (r *SQLChunkRepository) InsertChunk(ctx context.Context, chunk *models.Docu
 	}
 
 	query := `
-		INSERT INTO document_chunks (id, client_id, content, embedding, source_url, chunk_index, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO document_chunks (id, document_id, client_id, content, embedding, source_url, chunk_index, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 	`
+	var documentID interface{}
+	if chunk.DocumentID != "" {
+		documentID = chunk.DocumentID
+	}
 
 	_, err = r.DB.ExecContext(
 		ctx,
 		r.DB.Adapt(query),
 		chunk.ID,
+		documentID,
 		chunk.ClientID,
 		chunk.Content,
 		string(embJSON),
@@ -59,13 +66,70 @@ func (r *SQLChunkRepository) InsertChunk(ctx context.Context, chunk *models.Docu
 	return err
 }
 
+// ReplaceSourceChunks swaps one document or website source atomically. Existing
+// searchable content remains available if any insert in the replacement fails.
+func (r *SQLChunkRepository) ReplaceSourceChunks(
+	ctx context.Context,
+	clientID string,
+	documentID string,
+	sourceURL string,
+	chunks []models.DocumentChunk,
+) error {
+	tx, err := r.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if documentID != "" {
+		_, err = tx.ExecContext(ctx, r.DB.Adapt(`
+			DELETE FROM document_chunks WHERE client_id = $1 AND document_id = $2`), clientID, documentID)
+	} else {
+		_, err = tx.ExecContext(ctx, r.DB.Adapt(`
+			DELETE FROM document_chunks
+			WHERE client_id = $1 AND document_id IS NULL AND source_url = $2`), clientID, sourceURL)
+	}
+	if err != nil {
+		return err
+	}
+
+	for i := range chunks {
+		chunk := &chunks[i]
+		embeddingJSON, marshalErr := json.Marshal(chunk.Embedding)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		var storedDocumentID interface{}
+		if documentID != "" {
+			storedDocumentID = documentID
+		}
+		if _, err = tx.ExecContext(ctx, r.DB.Adapt(`
+			INSERT INTO document_chunks
+			  (id, document_id, client_id, content, embedding, source_url, chunk_index, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`),
+			chunk.ID,
+			storedDocumentID,
+			clientID,
+			chunk.Content,
+			string(embeddingJSON),
+			sourceURL,
+			chunk.ChunkIndex,
+			chunk.CreatedAt,
+		); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // GetChunksByClient retrieves all chunks belonging to a client.
 func (r *SQLChunkRepository) GetChunksByClient(ctx context.Context, clientID string) ([]models.DocumentChunk, error) {
 	query := `
-		SELECT id, client_id, content, embedding, source_url, chunk_index, created_at
+		SELECT id, document_id, client_id, content, embedding, source_url, chunk_index, created_at
 		FROM document_chunks
 		WHERE client_id = $1
-		ORDER BY chunk_index ASC
+		ORDER BY created_at DESC, chunk_index ASC
+		LIMIT 5000
 	`
 
 	rows, err := r.DB.QueryContext(ctx, r.DB.Adapt(query), clientID)
@@ -77,10 +141,12 @@ func (r *SQLChunkRepository) GetChunksByClient(ctx context.Context, clientID str
 	var chunks []models.DocumentChunk
 	for rows.Next() {
 		var c models.DocumentChunk
+		var documentID sql.NullString
 		var embStr string
-		if err := rows.Scan(&c.ID, &c.ClientID, &c.Content, &embStr, &c.SourceURL, &c.ChunkIndex, &c.CreatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &documentID, &c.ClientID, &c.Content, &embStr, &c.SourceURL, &c.ChunkIndex, &c.CreatedAt); err != nil {
 			return nil, err
 		}
+		c.DocumentID = documentID.String
 		if embStr != "" {
 			_ = json.Unmarshal([]byte(embStr), &c.Embedding)
 		}

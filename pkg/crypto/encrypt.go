@@ -7,13 +7,23 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"strings"
 )
 
+const ciphertextVersion = "v1:"
+
+func IsVersionedCiphertext(value string) bool {
+	return strings.HasPrefix(value, ciphertextVersion)
+}
+
 // EncryptAPIKey encrypts a plaintext API key using AES-256-GCM.
-// The encryptionKey is padded/truncated to exactly 32 bytes.
-// Returns a base64-encoded ciphertext string safe for DB storage.
+// The encryptionKey must be exactly 32 bytes. New values include an algorithm
+// version prefix so future rotations can distinguish storage formats.
 func EncryptAPIKey(encryptionKey, plaintext string) (string, error) {
-	key := padKey(encryptionKey)
+	key, err := validatedKey(encryptionKey)
+	if err != nil {
+		return "", err
+	}
 
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -31,49 +41,93 @@ func EncryptAPIKey(encryptionKey, plaintext string) (string, error) {
 	}
 
 	// Seal prepends the nonce so we can recover it during decryption.
-	ciphertext := gcm.Seal(nonce, nonce, []byte(plaintext), nil)
-	return base64.StdEncoding.EncodeToString(ciphertext), nil
+	ciphertext := gcm.Seal(nonce, nonce, []byte(plaintext), []byte(ciphertextVersion))
+	return ciphertextVersion + base64.StdEncoding.EncodeToString(ciphertext), nil
 }
 
-// DecryptAPIKey decrypts a base64-encoded AES-256-GCM ciphertext.
-// If decryption fails for any reason (e.g. legacy plaintext key stored before
-// encryption was enabled), the input is returned unchanged for backward compatibility.
+// DecryptAPIKey preserves the legacy string-only API. New code that handles
+// secrets should use DecryptAPIKeyWithError and fail closed on versioned data.
 func DecryptAPIKey(encryptionKey, ciphertext string) string {
-	data, err := base64.StdEncoding.DecodeString(ciphertext)
-	if err != nil {
-		// Not valid base64 — treat as a legacy plaintext key.
-		return ciphertext
-	}
-
-	key := padKey(encryptionKey)
-
-	block, err := aes.NewCipher(key)
+	plaintext, err := DecryptAPIKeyWithError(encryptionKey, ciphertext)
 	if err != nil {
 		return ciphertext
 	}
+	return plaintext
+}
 
+// DecryptAPIKeyWithError decrypts versioned values strictly while retaining
+// compatibility with legacy unversioned ciphertext and plaintext records.
+func DecryptAPIKeyWithError(encryptionKey, ciphertext string) (string, error) {
+	plaintext, _, err := DecryptAPIKeyWithKeyring(encryptionKey, nil, ciphertext)
+	return plaintext, err
+}
+
+// DecryptAPIKeyWithKeyring attempts the current key first, followed by
+// previous keys retained during a rotation window. The boolean reports when a
+// previous key was used so callers can schedule re-encryption.
+func DecryptAPIKeyWithKeyring(
+	currentKey string,
+	previousKeys []string,
+	ciphertext string,
+) (string, bool, error) {
+	keys := append([]string{currentKey}, previousKeys...)
+	for _, key := range keys {
+		if _, err := validatedKey(key); err != nil {
+			return "", false, err
+		}
+	}
+
+	encoded := ciphertext
+	additionalData := []byte(nil)
+	versioned := strings.HasPrefix(ciphertext, ciphertextVersion)
+	if versioned {
+		encoded = strings.TrimPrefix(ciphertext, ciphertextVersion)
+		additionalData = []byte(ciphertextVersion)
+	}
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		if !versioned {
+			return ciphertext, false, nil
+		}
+		return "", false, fmt.Errorf("decode versioned ciphertext: %w", err)
+	}
+
+	var lastError error
+	for index, candidateKey := range keys {
+		plaintext, decryptErr := decryptCiphertext(candidateKey, data, additionalData)
+		if decryptErr == nil {
+			return plaintext, index > 0, nil
+		}
+		lastError = decryptErr
+	}
+	if !versioned {
+		return ciphertext, false, nil
+	}
+	return "", false, fmt.Errorf("decrypt versioned ciphertext: %w", lastError)
+}
+
+func decryptCiphertext(key string, data, additionalData []byte) (string, error) {
+	block, err := aes.NewCipher([]byte(key))
+	if err != nil {
+		return "", fmt.Errorf("aes cipher init: %w", err)
+	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return ciphertext
+		return "", fmt.Errorf("gcm init: %w", err)
 	}
-
-	nonceSize := gcm.NonceSize()
-	if len(data) < nonceSize {
-		return ciphertext
+	if len(data) < gcm.NonceSize() {
+		return "", fmt.Errorf("ciphertext is too short")
 	}
-
-	plaintext, err := gcm.Open(nil, data[:nonceSize], data[nonceSize:], nil)
+	plaintext, err := gcm.Open(nil, data[:gcm.NonceSize()], data[gcm.NonceSize():], additionalData)
 	if err != nil {
-		// Decryption failed — return raw value (legacy plaintext key).
-		return ciphertext
+		return "", err
 	}
-
-	return string(plaintext)
+	return string(plaintext), nil
 }
 
-// padKey pads or truncates the key to exactly 32 bytes for AES-256.
-func padKey(key string) []byte {
-	b := make([]byte, 32)
-	copy(b, []byte(key))
-	return b
+func validatedKey(key string) ([]byte, error) {
+	if len([]byte(key)) != 32 {
+		return nil, fmt.Errorf("encryption key must be exactly 32 bytes")
+	}
+	return []byte(key), nil
 }

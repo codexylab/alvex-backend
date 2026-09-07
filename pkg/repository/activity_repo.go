@@ -30,7 +30,7 @@ type ActivityRepository interface {
 	GetWebTicketHistory(ctx context.Context, clientID, ticketRef string) ([]HistoryItem, error)
 	GetApprovedFAQs(ctx context.Context, clientID string) ([]models.FAQ, error)
 	CleanupOldChats(ctx context.Context, clientID string, retentionDays int) (int64, error)
-	UpdateReaction(ctx context.Context, id, reaction string) error
+	UpdateReaction(ctx context.Context, id, clientID, sessionID, reaction string) error
 }
 
 // SQLActivityRepository implements ActivityRepository.
@@ -196,12 +196,22 @@ func (r *SQLActivityRepository) CleanupOldChats(ctx context.Context, clientID st
 }
 
 // UpdateReaction updates the reaction of a message.
-func (r *SQLActivityRepository) UpdateReaction(ctx context.Context, id, reaction string) error {
-	_, err := r.DB.ExecContext(ctx, r.DB.Adapt(`
+func (r *SQLActivityRepository) UpdateReaction(ctx context.Context, id, clientID, sessionID, reaction string) error {
+	result, err := r.DB.ExecContext(ctx, r.DB.Adapt(`
 		UPDATE activity_logs
 		SET reaction = $1
-		WHERE id = $2`),
-		reaction, id,
+		WHERE id = $2 AND client_id = $3 AND session_id = $4 AND is_ticket = false`),
+		reaction, id, clientID, sessionID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
