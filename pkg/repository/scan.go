@@ -31,7 +31,7 @@ func scanClientRow(s scanner, includeOwnerAndGuardrails bool, includeRetention b
 	var widgetTicketingAllowed, widgetAdminMsgAllowed, widgetImageSearchAllowed sql.NullBool
 	var widgetBrandName, widgetLogoURL, widgetPrimaryColor, widgetSecondaryColor sql.NullString
 	var widgetRemoveBranding, widgetBrandingAllowed sql.NullBool
-	var guardrailsEnabled sql.NullInt64
+	var guardrailsEnabled sql.NullBool
 	var guardrailsReply sql.NullString
 	var chatRetentionDays sql.NullInt64
 
@@ -135,7 +135,7 @@ func scanClientRow(s scanner, includeOwnerAndGuardrails bool, includeRetention b
 			c.OwnerID = &ownerID.String
 		}
 		if guardrailsEnabled.Valid {
-			c.GuardrailsEnabled = guardrailsEnabled.Int64 == 1
+			c.GuardrailsEnabled = guardrailsEnabled.Bool
 		}
 		if guardrailsReply.Valid {
 			c.GuardrailsReply = guardrailsReply.String
