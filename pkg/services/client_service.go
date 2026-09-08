@@ -119,19 +119,11 @@ func (s *ClientService) Create(ctx context.Context, req models.CreateClientReque
 	}
 	req.Domain = normalizedDomain
 
-	// Generate a URL-safe slug ID from the client name
-	id := crypto.SlugifyClientName(req.Name)
-	if id == "" {
-		return nil, fmt.Errorf("could not generate a valid ID from the client name")
-	}
-
-	// Check duplicates
-	exists, err := s.Repo.ExistsByID(ctx, id)
+	// Client IDs are global database keys while reads are organization-scoped.
+	// Include a random suffix so equal names in different tenants cannot collide.
+	id, err := crypto.GenerateClientID(req.Name)
 	if err != nil {
 		return nil, err
-	}
-	if exists {
-		return nil, fmt.Errorf("duplicate: client with ID %q already exists", id)
 	}
 	allowedOrigins, err := validateAllowedOrigins(req.AllowedOrigins)
 	if err != nil {

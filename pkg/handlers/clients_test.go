@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -143,8 +144,50 @@ func TestClientHandler_Create(t *testing.T) {
 	if res.Data.Name != "Nexus Dynamics" {
 		t.Errorf("expected client name 'Nexus Dynamics', got '%s'", res.Data.Name)
 	}
-	if res.Data.ID != "nexus-dynamics" {
-		t.Errorf("expected client ID 'nexus-dynamics', got '%s'", res.Data.ID)
+	if !regexp.MustCompile(`^nexus-dynamics-[0-9a-f]{16}$`).MatchString(res.Data.ID) {
+		t.Errorf("expected globally unique client ID, got '%s'", res.Data.ID)
+	}
+}
+
+func TestClientHandler_CreateAllowsSameNameAcrossOrganizations(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+
+	_, err := db.Exec(`
+		INSERT INTO clients (id, organization_id, name, domain, owner_id)
+		VALUES ('junaid', 'org_other', 'junaid', 'https://junaid.example', 'dev-user-001')
+	`)
+	if err != nil {
+		t.Fatalf("failed to seed other tenant client: %v", err)
+	}
+
+	wrapDB := database.NewDB(db, "sqlite")
+	repo := repository.NewTenantSQLClientRepository(wrapDB)
+	handler := &ClientHandler{Service: services.NewClientService(repo, "", "http://localhost:8080")}
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/clients",
+		strings.NewReader(`{"name":"junaid","domain":"junaid.com","provider":"Gemini","model":"Gemini 2.5 Flash","billing_plan":"Basic"}`),
+	)
+	request = request.WithContext(tenant.WithScope(request.Context(), tenant.Scope{
+		OrganizationID: "org_test",
+		UserID:         "dev-user-001",
+		Role:           "owner",
+	}))
+	request = request.WithContext(context.WithValue(request.Context(), middleware.UserIDKey, "dev-user-001"))
+	responseRecorder := httptest.NewRecorder()
+
+	handler.Create(responseRecorder, request)
+	if responseRecorder.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", responseRecorder.Code, responseRecorder.Body.String())
+	}
+
+	var createdCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM clients WHERE organization_id = 'org_test' AND name = 'junaid'`).Scan(&createdCount); err != nil {
+		t.Fatalf("count created client: %v", err)
+	}
+	if createdCount != 1 {
+		t.Fatalf("expected one junaid client in org_test, got %d", createdCount)
 	}
 }
 

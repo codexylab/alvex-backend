@@ -10,8 +10,10 @@ import (
 )
 
 const (
-	machineKeyTag  = "alvx_sk_"
-	machineKeySize = 32
+	machineKeyTag      = "alvx_sk_"
+	machineKeySize     = 32
+	clientIDSuffixSize = 8
+	maxClientIDLength  = 100
 )
 
 // GenerateMachineAPIKey creates a high-entropy credential, its safe display
@@ -59,4 +61,26 @@ func SlugifyClientName(name string) string {
 		s = strings.ReplaceAll(s, "--", "-")
 	}
 	return strings.Trim(s, "-")
+}
+
+// GenerateClientID creates a readable, globally unique client identifier.
+// Client IDs are global primary keys even though client lookups are tenant
+// scoped, so a name-only slug is not sufficient across organizations.
+func GenerateClientID(name string) (string, error) {
+	base := SlugifyClientName(name)
+	if base == "" {
+		return "", fmt.Errorf("could not generate a valid ID from the client name")
+	}
+
+	randomSuffix := make([]byte, clientIDSuffixSize)
+	if _, err := rand.Read(randomSuffix); err != nil {
+		return "", fmt.Errorf("generate client ID: %w", err)
+	}
+	suffix := hex.EncodeToString(randomSuffix)
+
+	maxBaseLength := maxClientIDLength - len(suffix) - 1
+	if len(base) > maxBaseLength {
+		base = strings.TrimRight(base[:maxBaseLength], "-")
+	}
+	return base + "-" + suffix, nil
 }
